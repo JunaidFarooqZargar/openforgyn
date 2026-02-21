@@ -1,0 +1,50 @@
+[project]
+name = "openforgyn"
+version = "0.1.0"
+description = "An ultra-small AI agent that forges its own capabilities."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+authors = [{ name = "OpenForgyn Contributors" }]
+keywords = ["ai", "agent", "self-writing", "llm", "mcp"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "httpx~=0.28",
+    "click~=8.3",
+    "docker~=7.1",
+    "croniter~=6.0",
+]
+
+[project.scripts]
+forgyn = "forgyn.cli:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest~=9.0",
+    "pytest-asyncio~=1.3",
+    "ruff~=0.15",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["forgyn"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+markers = [
+    "docker: requires Docker daemon running",
+    "live_llm: requires real LLM API key",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
