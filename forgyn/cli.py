@@ -49,9 +49,11 @@ def _configure_logging(debug: bool = False, log_file: str | None = None) -> None
     logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 import forgyn
+from forgyn.bridge import Bridge, CLIChannel
 from forgyn.db import init_db
 from forgyn.models import PROVIDER_DEFAULTS, parse_model_string
 from forgyn.reasoner import Reasoner
+from forgyn.scheduler import Scheduler
 from forgyn.skill_writer import SkillWriter
 
 DEFAULT_DATA_DIR = Path.home() / ".forgyn"
@@ -125,7 +127,16 @@ def chat(ctx: click.Context):
         skills_dir=skills_dir,
         code_model_config=code_model_config,
     )
-    reasoner = Reasoner(model_config=model_config, db=db, skills_dir=skills_dir, skill_writer=skill_writer)
+
+    bridge = Bridge(db=db)
+    bridge.register_channel(CLIChannel())
+
+    scheduler = Scheduler(db=db, push_fn=bridge.push)
+
+    reasoner = Reasoner(
+        model_config=model_config, db=db, skills_dir=skills_dir,
+        skill_writer=skill_writer, scheduler=scheduler,
+    )
     reasoner.load_existing_skills()
 
     conversation_id = ctx.obj.get("conversation_id") or reasoner.new_conversation()
@@ -134,14 +145,30 @@ def chat(ctx: click.Context):
     click.echo(f"Model: {model_config.provider}/{model_config.model}")
     click.echo("Type 'exit' or Ctrl+C to quit.\n")
 
-    asyncio.run(_chat_loop(reasoner, conversation_id))
+    asyncio.run(_main_loop(reasoner, scheduler, bridge, conversation_id))
 
 
-async def _chat_loop(reasoner: Reasoner, conversation_id: str):
+async def _main_loop(reasoner: Reasoner, scheduler: Scheduler, bridge: Bridge, conversation_id: str):
+    """Start background services and run the chat loop."""
+    await bridge.start()
+    await scheduler.start()
+    try:
+        await _chat_loop(reasoner, bridge, conversation_id)
+    finally:
+        await scheduler.stop()
+        await bridge.stop()
+
+
+async def _chat_loop(reasoner: Reasoner, bridge: Bridge, conversation_id: str):
     """Interactive read-eval-print loop."""
+    loop = asyncio.get_event_loop()
     while True:
+        # Display any pending proactive messages
+        for msg in bridge.drain("cli"):
+            click.echo(f"\n[Forgyn] {msg}\n")
+
         try:
-            user_input = click.prompt(">", prompt_suffix=" ")
+            user_input = await loop.run_in_executor(None, lambda: click.prompt(">", prompt_suffix=" "))
         except (EOFError, KeyboardInterrupt):
             click.echo("\nGoodbye.")
             break

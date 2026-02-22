@@ -2,7 +2,8 @@
 
 import pytest
 
-from forgyn.bridge import Bridge
+from forgyn.bridge import Bridge, CLIChannel
+from forgyn.db import init_db
 
 
 class MockChannel:
@@ -164,3 +165,49 @@ async def test_no_handler_returns_message():
 
     response = await bridge.handle_message("test", "alice", "hello")
     assert "No message handler" in response
+
+
+# --- Outbox integration ---
+
+
+@pytest.mark.asyncio
+async def test_bridge_push_and_drain(tmp_db_path):
+    db = init_db(tmp_db_path)
+    bridge = Bridge(db=db)
+    await bridge.push("Hello from scheduler")
+    msgs = bridge.drain("cli")
+    assert msgs == ["Hello from scheduler"]
+
+
+@pytest.mark.asyncio
+async def test_bridge_drain_marks_delivered(tmp_db_path):
+    db = init_db(tmp_db_path)
+    bridge = Bridge(db=db)
+    await bridge.push("Message one")
+    bridge.drain("cli")
+    # Second drain returns empty
+    assert bridge.drain("cli") == []
+
+
+@pytest.mark.asyncio
+async def test_bridge_push_without_db():
+    """Bridge without db should silently ignore push/drain."""
+    bridge = Bridge()
+    await bridge.push("No DB")
+    assert bridge.drain("cli") == []
+
+
+# --- CLIChannel ---
+
+
+def test_cli_channel_name():
+    ch = CLIChannel()
+    assert ch.name == "cli"
+
+
+@pytest.mark.asyncio
+async def test_cli_channel_send_message(capsys):
+    ch = CLIChannel()
+    await ch.send_message("user", "Reminder: drink water")
+    captured = capsys.readouterr()
+    assert "Reminder: drink water" in captured.out

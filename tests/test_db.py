@@ -6,12 +6,15 @@ import pytest
 
 from forgyn.db import (
     add_message,
+    clear_delivered,
     create_conversation,
+    drain_outbox,
     get_due_schedules,
     get_messages,
     get_skill,
     init_db,
     list_skills,
+    push_outbox,
     save_schedule,
     save_skill,
 )
@@ -31,6 +34,7 @@ def test_init_creates_tables(db):
     assert "messages" in names
     assert "skills" in names
     assert "schedules" in names
+    assert "outbox" in names
 
 
 def test_wal_mode_enabled(db):
@@ -130,3 +134,51 @@ def test_due_schedules_filters_correctly(db):
 def test_foreign_key_enforcement(db):
     with pytest.raises(Exception):
         add_message(db, "nonexistent-conversation", "user", "Hello")
+
+
+# --- Outbox ---
+
+
+def test_outbox_push_and_drain(db):
+    push_outbox(db, "Hello from scheduler")
+    msgs = drain_outbox(db)
+    assert len(msgs) == 1
+    assert msgs[0]["text"] == "Hello from scheduler"
+
+
+def test_outbox_drain_marks_delivered(db):
+    push_outbox(db, "First message")
+    drain_outbox(db)
+    # Second drain should return empty
+    msgs = drain_outbox(db)
+    assert len(msgs) == 0
+
+
+def test_outbox_drain_by_channel(db):
+    push_outbox(db, "For CLI", channel="cli")
+    push_outbox(db, "For Telegram", channel="telegram")
+    push_outbox(db, "For all")  # channel=None → delivered to any channel
+
+    cli_msgs = drain_outbox(db, channel="cli")
+    # Should get the cli-specific message and the channel=None message
+    texts = [m["text"] for m in cli_msgs]
+    assert "For CLI" in texts
+    assert "For all" in texts
+    assert "For Telegram" not in texts
+
+
+def test_clear_delivered(db):
+    push_outbox(db, "Will be cleared")
+    drain_outbox(db)  # marks delivered
+    count = clear_delivered(db)
+    assert count == 1
+    # Table should be empty now
+    remaining = db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0]
+    assert remaining == 0
+
+
+def test_schedule_with_message(db):
+    save_skill(db, "reminder", {"description": "Reminder"})
+    sid = save_schedule(db, "reminder", "once", "2099-01-01T00:00:00+00:00", "2099-01-01T00:00:00+00:00", message="Drink water")
+    row = db.execute("SELECT message FROM schedules WHERE id = ?", (sid,)).fetchone()
+    assert row["message"] == "Drink water"

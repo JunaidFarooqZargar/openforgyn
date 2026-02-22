@@ -64,11 +64,13 @@ class Reasoner:
         db: sqlite3.Connection,
         skills_dir: Path,
         skill_writer=None,  # Set after Phase 2
+        scheduler=None,
     ):
         self.model_config = model_config
         self.db = db
         self.skills_dir = skills_dir
         self.skill_writer = skill_writer
+        self.scheduler = scheduler
         self._skill_tools: dict[str, dict] = {}  # name -> manifest
 
     def new_conversation(self, title: str | None = None) -> str:
@@ -205,6 +207,30 @@ class Reasoner:
                 },
             ))
 
+        if self.scheduler:
+            tools.append(ToolDef(
+                name="schedule_task",
+                description=(
+                    "Schedule a skill to run at a specific time or interval. "
+                    "Use for reminders, recurring checks, or delayed actions."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "schedule_type": {
+                            "type": "string", "enum": ["once", "cron", "interval"],
+                            "description": "once=run at specific time, cron=recurring cron, interval=every N ms",
+                        },
+                        "schedule_value": {
+                            "type": "string",
+                            "description": "For once: ISO datetime. For cron: cron expression. For interval: milliseconds as string.",
+                        },
+                        "message": {"type": "string", "description": "Message to deliver when the schedule fires"},
+                    },
+                    "required": ["schedule_type", "schedule_value", "message"],
+                },
+            ))
+
         for name, manifest in self._skill_tools.items():
             tools.append(ToolDef(
                 name=f"skill_{name}",
@@ -232,6 +258,8 @@ class Reasoner:
             return await self._tool_remember(arguments)
         elif name == "forget":
             return self._tool_forget(arguments)
+        elif name == "schedule_task" and self.scheduler:
+            return self._tool_schedule_task(arguments)
         elif name.startswith("skill_"):
             return await self._tool_run_skill(name[6:], arguments)
         return f"Unknown tool: {name}"
@@ -356,6 +384,17 @@ class Reasoner:
         if deleted:
             return f"Forgot: {key}"
         return f"No memory found with key '{key}'."
+
+    def _tool_schedule_task(self, args: dict) -> str:
+        schedule_type = args.get("schedule_type", "")
+        schedule_value = args.get("schedule_value", "")
+        message = args.get("message", "")
+        if not schedule_type or not schedule_value or not message:
+            return "Error: schedule_task requires schedule_type, schedule_value, and message."
+        if schedule_type not in ("once", "cron", "interval"):
+            return f"Error: invalid schedule_type '{schedule_type}'."
+        sid = self.scheduler.schedule("_system", schedule_type, schedule_value, message=message)
+        return f"Scheduled ({schedule_type}: {schedule_value}). Schedule ID: {sid}. Message: {message}"
 
     async def _retrieve_relevant_memories(self, user_message: str, top_k: int = 10) -> list[dict]:
         """Embed user message and find semantically similar context/knowledge memories."""

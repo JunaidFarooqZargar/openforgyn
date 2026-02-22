@@ -41,9 +41,11 @@ class Scheduler:
         self,
         db: sqlite3.Connection,
         execute_fn=None,
+        push_fn=None,
     ):
         self.db = db
         self.execute_fn = execute_fn  # async fn(skill_name, args) -> str
+        self.push_fn = push_fn  # async fn(text) -> None
         self._running = False
         self._task: asyncio.Task | None = None
 
@@ -52,13 +54,14 @@ class Scheduler:
         skill_name: str,
         schedule_type: str,
         schedule_value: str,
+        message: str | None = None,
     ) -> int:
         """Register a new schedule. Returns the schedule ID."""
         if schedule_type == "once":
             next_run = schedule_value  # The value IS the run time
         else:
             next_run = compute_next_run(schedule_type, schedule_value)
-        return save_schedule(self.db, skill_name, schedule_type, schedule_value, next_run)
+        return save_schedule(self.db, skill_name, schedule_type, schedule_value, next_run, message=message)
 
     def cancel(self, schedule_id: int) -> None:
         """Cancel a schedule by marking it paused."""
@@ -69,9 +72,12 @@ class Scheduler:
         due = get_due_schedules(self.db)
         fired = 0
         for sched in due:
+            text = sched.get("message")
             try:
-                if self.execute_fn:
-                    await self.execute_fn(sched["skill_name"], {})
+                if not text and self.execute_fn:
+                    text = await self.execute_fn(sched["skill_name"], {})
+                if self.push_fn and text:
+                    await self.push_fn(text)
                 fired += 1
             except Exception as e:
                 log.error("Schedule %s failed: %s", sched["id"], e)

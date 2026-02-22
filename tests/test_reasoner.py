@@ -5,9 +5,10 @@ from unittest.mock import patch
 
 import pytest
 
-from forgyn.db import get_messages, init_db
+from forgyn.db import get_messages, init_db, save_skill
 from forgyn.models import ChatResponse, ModelConfig
 from forgyn.reasoner import Reasoner
+from forgyn.scheduler import Scheduler
 
 
 @pytest.fixture
@@ -195,3 +196,52 @@ async def test_read_file_not_found_lists_existing(reasoner, skills_dir):
     result = reasoner._tool_read_file({"path": "reminder/wrong_name.py"})
     assert "Error" in result
     assert "handler.py" in result
+
+
+# --- schedule_task tool ---
+
+
+def test_schedule_task_tool(model_config, db, skills_dir):
+    """Reasoner with scheduler can create schedules via the tool."""
+    scheduler = Scheduler(db=db)
+    r = Reasoner(model_config=model_config, db=db, skills_dir=skills_dir, scheduler=scheduler)
+
+    result = r._tool_schedule_task({
+        "schedule_type": "once",
+        "schedule_value": "2099-01-01T00:00:00+00:00",
+        "message": "Drink water",
+    })
+    assert "Scheduled" in result
+    assert "Drink water" in result
+
+    # Verify schedule was persisted with _system skill_name
+    row = db.execute("SELECT * FROM schedules WHERE skill_name = '_system'").fetchone()
+    assert row is not None
+    assert row["message"] == "Drink water"
+
+
+def test_schedule_task_tool_appears_in_tools(model_config, db, skills_dir):
+    """schedule_task should appear in tool list when scheduler is present."""
+    scheduler = Scheduler(db=db)
+    r = Reasoner(model_config=model_config, db=db, skills_dir=skills_dir, scheduler=scheduler)
+    tool_names = [t.name for t in r._get_tools()]
+    assert "schedule_task" in tool_names
+
+
+def test_schedule_task_tool_absent_without_scheduler(model_config, db, skills_dir):
+    """schedule_task should NOT appear when no scheduler is set."""
+    r = Reasoner(model_config=model_config, db=db, skills_dir=skills_dir)
+    tool_names = [t.name for t in r._get_tools()]
+    assert "schedule_task" not in tool_names
+
+
+def test_schedule_task_tool_validation(model_config, db, skills_dir):
+    """schedule_task should reject invalid inputs."""
+    scheduler = Scheduler(db=db)
+    r = Reasoner(model_config=model_config, db=db, skills_dir=skills_dir, scheduler=scheduler)
+
+    result = r._tool_schedule_task({"schedule_type": "", "schedule_value": "x", "message": "m"})
+    assert "Error" in result
+
+    result = r._tool_schedule_task({"schedule_type": "bad", "schedule_value": "x", "message": "m"})
+    assert "Error" in result

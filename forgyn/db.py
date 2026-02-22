@@ -39,8 +39,18 @@ CREATE TABLE IF NOT EXISTS schedules (
     schedule_type  TEXT NOT NULL,
     schedule_value TEXT NOT NULL,
     next_run       TEXT,
+    message        TEXT,
     status         TEXT NOT NULL DEFAULT 'active',
     created_at     TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS outbox (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel    TEXT,
+    recipient  TEXT,
+    text       TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    delivered  INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS memories (
@@ -75,8 +85,22 @@ def init_db(path: Path) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(SCHEMA)
+    _migrate(conn)
     conn.commit()
     return conn
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Apply incremental schema migrations for existing databases."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(schedules)").fetchall()}
+    if "message" not in cols:
+        conn.execute("ALTER TABLE schedules ADD COLUMN message TEXT")
+    # Ensure the _system pseudo-skill exists for message-only schedules (reminders)
+    conn.execute(
+        "INSERT OR IGNORE INTO skills (name, status, manifest, created_at, updated_at)"
+        " VALUES ('_system', 'active', '{}', ?, ?)",
+        (_now(), _now()),
+    )
 
 
 # --- Conversations ---
@@ -151,11 +175,15 @@ def get_skill(db: sqlite3.Connection, name: str) -> dict | None:
 
 
 def list_skills(db: sqlite3.Connection, status: str | None = None) -> list[dict]:
-    """List all skills, optionally filtered by status."""
+    """List all user-facing skills (excludes internal _system skill)."""
     if status:
-        rows = db.execute("SELECT * FROM skills WHERE status = ? ORDER BY name", (status,)).fetchall()
+        rows = db.execute(
+            "SELECT * FROM skills WHERE status = ? AND name != '_system' ORDER BY name", (status,),
+        ).fetchall()
     else:
-        rows = db.execute("SELECT * FROM skills ORDER BY name").fetchall()
+        rows = db.execute(
+            "SELECT * FROM skills WHERE name != '_system' ORDER BY name"
+        ).fetchall()
     return [_row_to_dict(r) for r in rows]
 
 
@@ -167,12 +195,13 @@ def save_schedule(
     schedule_type: str,
     schedule_value: str,
     next_run: str | None,
+    message: str | None = None,
 ) -> int:
     """Create a schedule. Returns the schedule row ID."""
     cur = db.execute(
-        "INSERT INTO schedules (skill_name, schedule_type, schedule_value, next_run, status, created_at)"
-        " VALUES (?, ?, ?, ?, 'active', ?)",
-        (skill_name, schedule_type, schedule_value, next_run, _now()),
+        "INSERT INTO schedules (skill_name, schedule_type, schedule_value, next_run, message, status, created_at)"
+        " VALUES (?, ?, ?, ?, ?, 'active', ?)",
+        (skill_name, schedule_type, schedule_value, next_run, message, _now()),
     )
     db.commit()
     return cur.lastrowid
@@ -268,6 +297,46 @@ def get_memories_with_embeddings(db: sqlite3.Connection) -> list[dict]:
         " ORDER BY updated_at DESC"
     ).fetchall()
     return [_row_to_dict(r) for r in rows]
+
+
+# --- Outbox ---
+
+def push_outbox(
+    db: sqlite3.Connection, text: str, channel: str | None = None, recipient: str | None = None,
+) -> int:
+    """Insert a pending outbox message. Returns the row ID."""
+    cur = db.execute(
+        "INSERT INTO outbox (channel, recipient, text, created_at) VALUES (?, ?, ?, ?)",
+        (channel, recipient, text, _now()),
+    )
+    db.commit()
+    return cur.lastrowid
+
+
+def drain_outbox(db: sqlite3.Connection, channel: str | None = None) -> list[dict]:
+    """Fetch and mark delivered all undelivered messages for a channel (or all)."""
+    if channel:
+        rows = db.execute(
+            "SELECT * FROM outbox WHERE delivered = 0 AND (channel IS NULL OR channel = ?) ORDER BY id",
+            (channel,),
+        ).fetchall()
+    else:
+        rows = db.execute(
+            "SELECT * FROM outbox WHERE delivered = 0 ORDER BY id"
+        ).fetchall()
+    if rows:
+        ids = [r["id"] for r in rows]
+        placeholders = ",".join("?" * len(ids))
+        db.execute(f"UPDATE outbox SET delivered = 1 WHERE id IN ({placeholders})", ids)
+        db.commit()
+    return [_row_to_dict(r) for r in rows]
+
+
+def clear_delivered(db: sqlite3.Connection) -> int:
+    """Delete old delivered outbox messages. Returns count deleted."""
+    cur = db.execute("DELETE FROM outbox WHERE delivered = 1")
+    db.commit()
+    return cur.rowcount
 
 
 # --- Helpers ---

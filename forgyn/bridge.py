@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 import logging
+import sqlite3
 from typing import Protocol, runtime_checkable
+
+import click
+
+from forgyn.db import drain_outbox, push_outbox
 
 log = logging.getLogger(__name__)
 
@@ -19,16 +24,44 @@ class Channel(Protocol):
     async def disconnect(self) -> None: ...
 
 
+class CLIChannel:
+    """Channel for the interactive CLI — proactive messages print to terminal."""
+
+    name = "cli"
+
+    async def connect(self) -> None:
+        pass  # CLI is always connected
+
+    async def send_message(self, recipient: str, text: str) -> None:
+        click.echo(f"\n[Forgyn] {text}\n")
+
+    async def disconnect(self) -> None:
+        pass
+
+
 class Bridge:
     """Routes incoming messages from channels to the reasoner and responses back."""
 
-    def __init__(self, on_message_fn=None):
+    def __init__(self, on_message_fn=None, db: sqlite3.Connection | None = None):
         self.on_message_fn = on_message_fn  # async fn(sender, text) -> str
+        self.db = db
         self.channels: dict[str, Channel] = {}
 
     def register_channel(self, channel: Channel) -> None:
         """Register a messaging channel."""
         self.channels[channel.name] = channel
+
+    async def push(self, text: str, channel: str | None = None, recipient: str | None = None) -> None:
+        """Write a proactive message to the outbox."""
+        if self.db is not None:
+            push_outbox(self.db, text, channel, recipient)
+
+    def drain(self, channel_name: str | None = None) -> list[str]:
+        """Fetch pending outbox messages for a channel. Returns list of text strings."""
+        if self.db is None:
+            return []
+        rows = drain_outbox(self.db, channel_name)
+        return [r["text"] for r in rows]
 
     async def start(self) -> None:
         """Connect all registered channels."""

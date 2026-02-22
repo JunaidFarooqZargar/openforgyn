@@ -73,6 +73,7 @@ async def test_tick_fires_due_task(db):
 
     async def mock_execute(skill_name, args):
         fired_skills.append(skill_name)
+        return f"Executed {skill_name}"
 
     sched = Scheduler(db=db, execute_fn=mock_execute)
     # Create a past-due schedule
@@ -161,3 +162,48 @@ async def test_cancel(db):
     sched.cancel(sid)
     row = db.execute("SELECT status FROM schedules WHERE id = ?", (sid,)).fetchone()
     assert row["status"] == "paused"
+
+
+@pytest.mark.asyncio
+async def test_scheduler_pushes_to_outbox(db):
+    """When execute_fn returns text, push_fn should be called with that text."""
+    pushed = []
+
+    async def mock_execute(skill_name, args):
+        return "Result from skill"
+
+    async def mock_push(text):
+        pushed.append(text)
+
+    sched = Scheduler(db=db, execute_fn=mock_execute, push_fn=mock_push)
+    past = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+    from forgyn.db import save_schedule
+    save_schedule(db, "echo", "interval", "60000", past)
+
+    await sched.tick()
+    assert pushed == ["Result from skill"]
+
+
+@pytest.mark.asyncio
+async def test_scheduler_pushes_message_without_execute(db):
+    """A schedule with a message should push directly without calling execute_fn."""
+    pushed = []
+
+    async def mock_push(text):
+        pushed.append(text)
+
+    sched = Scheduler(db=db, push_fn=mock_push)
+    past = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    from forgyn.db import save_schedule
+    save_schedule(db, "echo", "once", past, past, message="Drink water")
+
+    await sched.tick()
+    assert pushed == ["Drink water"]
+
+
+@pytest.mark.asyncio
+async def test_schedule_with_message_param(db):
+    sched = Scheduler(db=db)
+    sid = sched.schedule("echo", "once", "2099-01-01T00:00:00+00:00", message="Test reminder")
+    row = db.execute("SELECT message FROM schedules WHERE id = ?", (sid,)).fetchone()
+    assert row["message"] == "Test reminder"
