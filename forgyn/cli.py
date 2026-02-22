@@ -85,6 +85,13 @@ def chat(ctx: click.Context):
         sys.exit(1)
 
     db = init_db(db_path)
+
+    # Clean up expired memories on session start
+    from forgyn.db import delete_expired_memories
+    expired = delete_expired_memories(db)
+    if expired:
+        logging.getLogger(__name__).debug("Cleaned up %d expired memories", expired)
+
     skill_writer = SkillWriter(
         model_config=model_config,
         db=db,
@@ -140,6 +147,39 @@ def skills(ctx: click.Context):
     click.echo("-" * 50)
     for s in skill_list:
         click.echo(f"{s['name']:<20} {s['status']:<10} {s['created_at']}")
+
+
+@main.command()
+@click.pass_context
+def memories(ctx: click.Context):
+    """List all stored memories."""
+    data_dir = ensure_data_dir(ctx.obj["data_dir"])
+    db = init_db(data_dir / "forgyn.db")
+
+    from forgyn.db import list_memories
+
+    mem_list = list_memories(db)
+    if not mem_list:
+        click.echo("No memories stored.")
+        return
+
+    click.echo(f"{'Key':<25} {'Value':<35} {'Category':<12} {'Updated'}")
+    click.echo("-" * 90)
+    for m in mem_list:
+        val = m["value"][:33] + ".." if len(m["value"]) > 35 else m["value"]
+        click.echo(f"{m['key']:<25} {val:<35} {m['category']:<12} {m['updated_at']}")
+
+
+@main.command()
+@click.confirmation_option(prompt="Delete all stored memories?")
+@click.pass_context
+def forget_all(ctx: click.Context):
+    """Delete all stored memories."""
+    data_dir = ensure_data_dir(ctx.obj["data_dir"])
+    db = init_db(data_dir / "forgyn.db")
+    count = db.execute("DELETE FROM memories").rowcount
+    db.commit()
+    click.echo(f"Deleted {count} memories.")
 
 
 @main.command()

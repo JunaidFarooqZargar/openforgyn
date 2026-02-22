@@ -7,8 +7,13 @@ import logging
 import sqlite3
 from pathlib import Path
 
-from forgyn.db import add_message, create_conversation, get_messages, list_skills
-from forgyn.models import Message, ModelConfig, ToolDef, chat
+import math
+
+from forgyn.db import (
+    add_message, create_conversation, get_messages, get_memories_with_embeddings,
+    list_memories, list_skills, save_memory, delete_memory,
+)
+from forgyn.models import Message, ModelConfig, ToolDef, chat, embed
 
 log = logging.getLogger(__name__)
 
@@ -32,6 +37,21 @@ Guidelines:
   parameterized and reusable for different inputs.
 - When naming skills, use broad category names (e.g. "weather", "currency_convert",
   "translate") not specific instance names (e.g. "weather_london", "convert_usd_eur").
+- You have long-term memory that persists across conversations. You MUST actively
+  use it. Saying "I'll remember that" without calling the remember tool means
+  you WILL forget it next session.
+- Call the remember tool when the user shares anything you would need in a future
+  conversation: who they are, what they're working on, how they prefer things,
+  facts about their setup. When in doubt, remember it — a forgotten fact costs
+  the user more than a redundant memory.
+- Do NOT remember: throwaway chit-chat, one-off questions, or things only relevant
+  to the current exchange. Do NOT store passwords or raw API keys.
+- Categories:
+  - "identity" — name, role, location, background
+  - "preference" — timezone, language, tools, communication style
+  - "context" — current project, upcoming deadline, temporary situation
+  - "knowledge" — server IPs, workflows, team structure, technical facts
+- When the user asks you to forget something, use the forget tool.
 """
 
 
@@ -58,7 +78,12 @@ class Reasoner:
     async def run(self, conversation_id: str, user_message: str) -> str:
         """Process a user message and return the assistant's response."""
         add_message(self.db, conversation_id, "user", user_message)
-        messages = self._build_messages(conversation_id)
+
+        # Retrieve semantically relevant memories for this message
+        relevant = await self._retrieve_relevant_memories(user_message)
+        log.debug("Retrieved %d relevant memories", len(relevant))
+
+        messages = self._build_messages(conversation_id, relevant_memories=relevant)
         tools = self._get_tools()
 
         for iteration in range(MAX_TOOL_ITERATIONS):
@@ -102,10 +127,17 @@ class Reasoner:
         # Hit max iterations — return whatever we have
         return "(Reached maximum tool iterations. Please try again with a simpler request.)"
 
-    def _build_messages(self, conversation_id: str) -> list[Message]:
-        """Load conversation history from DB and prepend system prompt."""
+    def _build_messages(self, conversation_id: str, relevant_memories: list[dict] | None = None) -> list[Message]:
+        """Load conversation history from DB and prepend system prompt with memories."""
         rows = get_messages(self.db, conversation_id)
-        messages = [Message(role="system", content=SYSTEM_PROMPT)]
+
+        # Build memory section for system prompt
+        memory_section = self._build_memory_section(relevant_memories)
+        system_content = SYSTEM_PROMPT
+        if memory_section:
+            system_content += "\n" + memory_section
+
+        messages = [Message(role="system", content=system_content)]
         for row in rows:
             tc = json.loads(row["tool_calls"]) if row.get("tool_calls") else None
             messages.append(Message(
@@ -115,6 +147,25 @@ class Reasoner:
                 tool_call_id=row.get("tool_call_id"),
             ))
         return messages
+
+    def _build_memory_section(self, relevant_memories: list[dict] | None = None) -> str:
+        """Build a '## What you know about the user' section from stored memories."""
+        lines = []
+
+        # Core memories: identity + preference — always included
+        for cat in ("identity", "preference"):
+            for m in list_memories(self.db, category=cat):
+                lines.append(f"- [{cat}] {m['key']}: {m['value']}")
+
+        # Contextual memories from semantic search
+        if relevant_memories:
+            for m in relevant_memories:
+                cat = m["category"]
+                lines.append(f"- [{cat}] {m['key']}: {m['value']}")
+
+        if not lines:
+            return ""
+        return "## What you know about the user\n" + "\n".join(lines)
 
     def _get_tools(self) -> list[ToolDef]:
         """Return all available tools: built-ins + installed skills."""
@@ -157,6 +208,10 @@ class Reasoner:
             return self._tool_write_file(arguments)
         elif name == "write_skill" and self.skill_writer:
             return await self._tool_write_skill(arguments)
+        elif name == "remember":
+            return await self._tool_remember(arguments)
+        elif name == "forget":
+            return self._tool_forget(arguments)
         elif name.startswith("skill_"):
             return await self._tool_run_skill(name[6:], arguments)
         return f"Unknown tool: {name}"
@@ -221,6 +276,46 @@ class Reasoner:
         except Exception as e:
             return f"Error running skill '{skill_name}': {e}"
 
+    async def _tool_remember(self, args: dict) -> str:
+        key = args.get("key", "")
+        value = args.get("value", "")
+        category = args.get("category", "knowledge")
+        if not key or not value:
+            return "Error: remember requires 'key' and 'value'."
+        if category not in ("identity", "preference", "context", "knowledge"):
+            return f"Error: invalid category '{category}'."
+        embedding = await embed(self.model_config, value)
+        save_memory(self.db, key, value, category, embedding or None)
+        log.debug("Remembered [%s] %s = %s (embedding dims: %d)", category, key, value, len(embedding))
+        return f"Remembered: {key} = {value} [{category}]"
+
+    def _tool_forget(self, args: dict) -> str:
+        key = args.get("key", "")
+        if not key:
+            return "Error: forget requires 'key'."
+        deleted = delete_memory(self.db, key)
+        if deleted:
+            return f"Forgot: {key}"
+        return f"No memory found with key '{key}'."
+
+    async def _retrieve_relevant_memories(self, user_message: str, top_k: int = 10) -> list[dict]:
+        """Embed user message and find semantically similar context/knowledge memories."""
+        msg_embedding = await embed(self.model_config, user_message)
+        if not msg_embedding:
+            return []  # No embedding support — skip semantic retrieval
+
+        candidates = get_memories_with_embeddings(self.db)
+        scored = []
+        for mem in candidates:
+            mem_embedding = json.loads(mem["embedding"])
+            score = _cosine_similarity(msg_embedding, mem_embedding)
+            if score > 0.3:  # Minimum relevance threshold
+                scored.append((score, mem))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        log.debug("Memory similarity scores: %s", [(s, m["key"]) for s, m in scored[:top_k]])
+        return [m for _, m in scored[:top_k]]
+
     def register_skill(self, name: str, manifest: dict) -> None:
         """Register a deployed skill so it appears in the tool list."""
         self._skill_tools[name] = manifest
@@ -263,4 +358,50 @@ BUILTIN_TOOLS = [
             "required": ["path", "content"],
         },
     ),
+    ToolDef(
+        name="remember",
+        description=(
+            "Save a fact about the user to long-term memory. Use category: "
+            "'identity' (name, role), 'preference' (timezone, tools), "
+            "'context' (current project), 'knowledge' (workflows, server info)."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "key": {"type": "string", "description": "Short identifier (e.g. user_name, preferred_city)"},
+                "value": {"type": "string", "description": "The fact to remember"},
+                "category": {
+                    "type": "string",
+                    "enum": ["identity", "preference", "context", "knowledge"],
+                    "description": "Memory category (default: knowledge)",
+                },
+            },
+            "required": ["key", "value"],
+        },
+    ),
+    ToolDef(
+        name="forget",
+        description="Delete a specific fact from long-term memory by its key.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "key": {"type": "string", "description": "The memory key to forget"},
+            },
+            "required": ["key"],
+        },
+    ),
 ]
+
+
+# --- Helpers ---
+
+def _cosine_similarity(a: list[float], b: list[float]) -> float:
+    """Compute cosine similarity between two vectors."""
+    if len(a) != len(b) or not a:
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = math.sqrt(sum(x * x for x in a))
+    norm_b = math.sqrt(sum(x * x for x in b))
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 SCHEMA = """
@@ -42,7 +42,26 @@ CREATE TABLE IF NOT EXISTS schedules (
     status         TEXT NOT NULL DEFAULT 'active',
     created_at     TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS memories (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    key        TEXT NOT NULL UNIQUE,
+    value      TEXT NOT NULL,
+    category   TEXT NOT NULL DEFAULT 'knowledge',
+    embedding  TEXT,
+    source     TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
+
+# Category-based TTL in days (None = never expires)
+MEMORY_TTL = {
+    "identity": None,
+    "preference": 90,
+    "context": 7,
+    "knowledge": 30,
+}
 
 
 def _now() -> str:
@@ -176,6 +195,79 @@ def update_schedule(db: sqlite3.Connection, schedule_id: int, **fields) -> None:
     vals = list(fields.values()) + [schedule_id]
     db.execute(f"UPDATE schedules SET {sets} WHERE id = ?", vals)
     db.commit()
+
+
+# --- Memories ---
+
+def save_memory(
+    db: sqlite3.Connection,
+    key: str,
+    value: str,
+    category: str = "knowledge",
+    embedding: list[float] | None = None,
+    source: str | None = None,
+) -> None:
+    """Insert or update a memory."""
+    now = _now()
+    emb_json = json.dumps(embedding) if embedding else None
+    db.execute(
+        "INSERT INTO memories (key, value, category, embedding, source, created_at, updated_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?)"
+        " ON CONFLICT(key) DO UPDATE SET value=?, category=?, embedding=?, source=?, updated_at=?",
+        (key, value, category, emb_json, source, now, now,
+         value, category, emb_json, source, now),
+    )
+    db.commit()
+
+
+def get_memory(db: sqlite3.Connection, key: str) -> dict | None:
+    """Fetch a single memory by key."""
+    row = db.execute("SELECT * FROM memories WHERE key = ?", (key,)).fetchone()
+    return _row_to_dict(row) if row else None
+
+
+def list_memories(db: sqlite3.Connection, category: str | None = None) -> list[dict]:
+    """List all memories, optionally filtered by category."""
+    if category:
+        rows = db.execute(
+            "SELECT * FROM memories WHERE category = ? ORDER BY updated_at DESC", (category,)
+        ).fetchall()
+    else:
+        rows = db.execute("SELECT * FROM memories ORDER BY updated_at DESC").fetchall()
+    return [_row_to_dict(r) for r in rows]
+
+
+def delete_memory(db: sqlite3.Connection, key: str) -> bool:
+    """Delete a memory by key. Returns True if a row was deleted."""
+    cur = db.execute("DELETE FROM memories WHERE key = ?", (key,))
+    db.commit()
+    return cur.rowcount > 0
+
+
+def delete_expired_memories(db: sqlite3.Connection) -> int:
+    """Delete memories past their category TTL. Returns count of deleted rows."""
+    now = datetime.now(timezone.utc)
+    total = 0
+    for category, ttl_days in MEMORY_TTL.items():
+        if ttl_days is None:
+            continue
+        cutoff = (now - timedelta(days=ttl_days)).isoformat()
+        cur = db.execute(
+            "DELETE FROM memories WHERE category = ? AND updated_at < ?",
+            (category, cutoff),
+        )
+        total += cur.rowcount
+    db.commit()
+    return total
+
+
+def get_memories_with_embeddings(db: sqlite3.Connection) -> list[dict]:
+    """Fetch context + knowledge memories that have embeddings for similarity search."""
+    rows = db.execute(
+        "SELECT * FROM memories WHERE category IN ('context', 'knowledge') AND embedding IS NOT NULL"
+        " ORDER BY updated_at DESC"
+    ).fetchall()
+    return [_row_to_dict(r) for r in rows]
 
 
 # --- Helpers ---

@@ -250,6 +250,43 @@ def _parse_anthropic_response(data: dict) -> ChatResponse:
     )
 
 
+# --- Embedding function ---
+
+EMBEDDING_MODELS = {
+    "openai": "text-embedding-3-small",
+    "ollama": "nomic-embed-text",
+    "gemini": "text-embedding-004",
+}
+
+
+async def embed(config: ModelConfig, text: str) -> list[float]:
+    """Get an embedding vector for text. Returns empty list if provider has no embedding API."""
+    if config.provider == "anthropic":
+        return []  # Anthropic has no embedding API
+
+    emb_model = EMBEDDING_MODELS.get(config.provider, "text-embedding-3-small")
+    base_url = config.base_url or PROVIDER_DEFAULTS.get(config.provider, {}).get(
+        "base_url", "https://api.openai.com/v1"
+    )
+    url = f"{base_url}/embeddings"
+
+    headers = {"Content-Type": "application/json"}
+    if config.api_key:
+        headers["Authorization"] = f"Bearer {config.api_key}"
+
+    body = {"model": emb_model, "input": text}
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        try:
+            resp = await client.post(url, json=body, headers=headers)
+            resp.raise_for_status()
+        except (httpx.ConnectError, httpx.HTTPStatusError):
+            return []  # Graceful fallback — embeddings are optional
+
+    data = resp.json()
+    return data.get("data", [{}])[0].get("embedding", [])
+
+
 async def _chat_anthropic(
     config: ModelConfig,
     messages: list[Message],
