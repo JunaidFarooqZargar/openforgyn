@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from pathlib import Path
 
 from forgyn.db import add_message, create_conversation, get_messages, list_skills
 from forgyn.models import Message, ModelConfig, ToolDef, chat
+
+log = logging.getLogger(__name__)
 
 MAX_TOOL_ITERATIONS = 10
 
@@ -23,6 +26,12 @@ Guidelines:
 - When you need a capability you don't have, tell the user you can build it
   and use the write_skill tool.
 - Always explain what you built after creating a new skill.
+- IMPORTANT: Always create GENERIC, REUSABLE skills. For example, if the user asks
+  for the weather in Paris, create a general "weather" skill that accepts any city
+  as a parameter — not a "weather_paris" skill. Skills should be like functions:
+  parameterized and reusable for different inputs.
+- When naming skills, use broad category names (e.g. "weather", "currency_convert",
+  "translate") not specific instance names (e.g. "weather_london", "convert_usd_eur").
 """
 
 
@@ -52,7 +61,8 @@ class Reasoner:
         messages = self._build_messages(conversation_id)
         tools = self._get_tools()
 
-        for _ in range(MAX_TOOL_ITERATIONS):
+        for iteration in range(MAX_TOOL_ITERATIONS):
+            log.debug("Iteration %d — calling LLM with %d messages, %d tools", iteration + 1, len(messages), len(tools))
             response = await chat(self.model_config, messages, tools)
 
             if response.tool_calls:
@@ -74,7 +84,9 @@ class Reasoner:
                         args = json.loads(fn["arguments"]) if isinstance(fn["arguments"], str) else fn["arguments"]
                     except json.JSONDecodeError:
                         args = {}
+                    log.debug("Tool call: %s(%s)", tool_name, json.dumps(args, default=str)[:200])
                     result = await self._execute_tool(tool_name, args)
+                    log.debug("Tool result: %s", result[:500] if result else "(empty)")
 
                     add_message(
                         self.db, conversation_id, "tool", result, tool_call_id=tc["id"],
@@ -83,6 +95,7 @@ class Reasoner:
             else:
                 # Final text response
                 text = response.content or ""
+                log.debug("Final response: %s", text[:200])
                 add_message(self.db, conversation_id, "assistant", text)
                 return text
 
@@ -110,12 +123,16 @@ class Reasoner:
         if self.skill_writer:
             tools.append(ToolDef(
                 name="write_skill",
-                description="Write a new skill from scratch. Use when the user needs a capability that doesn't exist yet.",
+                description=(
+                    "Write a new generic, reusable skill from scratch. Use when the user needs "
+                    "a capability that doesn't exist yet. Skills must be parameterized — e.g. a "
+                    "'weather' skill that accepts any city, not a 'weather_london' skill."
+                ),
                 parameters={
                     "type": "object",
                     "properties": {
-                        "name": {"type": "string", "description": "Short snake_case name for the skill"},
-                        "description": {"type": "string", "description": "What the skill should do"},
+                        "name": {"type": "string", "description": "Short generic snake_case name (e.g. 'weather', 'translate', 'currency_convert')"},
+                        "description": {"type": "string", "description": "What the skill does generically, mentioning the parameters it should accept"},
                     },
                     "required": ["name", "description"],
                 },

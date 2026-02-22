@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 from forgyn.audit import commit_skill, init_skills_repo
 from forgyn.db import save_skill
@@ -14,6 +17,25 @@ from forgyn.permissions import PermissionRequest, request_permissions, validate_
 from forgyn.sandbox import run_in_sandbox
 
 MAX_RETRIES = 3
+
+# Injected into every skill directory so pytest-asyncio works in the sandbox.
+CONFTEST_PY = """\
+import pytest_asyncio  # noqa: F401
+
+def pytest_collection_modifyitems(items):
+    for item in items:
+        if item.get_closest_marker("asyncio") is None:
+            import asyncio, inspect
+            if inspect.iscoroutinefunction(item.obj):
+                item.add_marker(pytest.mark.asyncio)
+
+pytest_plugins = ["pytest_asyncio"]
+"""
+
+PYTEST_INI = """\
+[pytest]
+asyncio_mode = auto
+"""
 
 
 @dataclass
@@ -31,7 +53,9 @@ Generate a JSON manifest for a Python skill with these details:
 
 The manifest must be a JSON object with these fields:
 - "name": string (the skill name)
-- "description": string (what the skill does)
+- "description": string (what the skill does, generically)
+- "parameters": object (JSON Schema for the arguments the skill's run() function accepts), e.g.:
+  {{"type": "object", "properties": {{"city": {{"type": "string", "description": "City name"}}}}, "required": ["city"]}}
 - "permissions": list of strings. Valid permissions:
   - "network" (if the skill needs HTTP access)
   - "env:VAR_NAME" (for each environment variable needed)
@@ -40,6 +64,9 @@ The manifest must be a JSON object with these fields:
 - "dependencies": list of pip package names needed (e.g. ["requests"])
 - "entry_point": "handler.py"
 - "test_file": "test_handler.py"
+
+IMPORTANT: The skill must be GENERIC and REUSABLE. Use parameters for any variable
+input (cities, languages, amounts, etc). Never hardcode specific values.
 
 Respond with ONLY the JSON object, no markdown fencing, no explanation."""
 
@@ -52,6 +79,10 @@ Requirements:
 - Return format: {{"result": "...", "error": null}} on success
 - Return format: {{"result": null, "error": "..."}} on failure
 - Available dependencies: {dependencies}
+- The skill MUST be generic and reusable. Accept parameters from the args dict
+  for any variable input (e.g. city name, language, amount). NEVER hardcode
+  specific values like city names, URLs with specific queries, etc.
+- Read any needed API keys from environment variables using os.environ.get()
 - Keep it simple and focused
 
 Respond with ONLY the Python code, no markdown fencing, no explanation."""
@@ -119,6 +150,7 @@ class SkillWriter:
         init_skills_repo(self.skills_dir)
 
         # Step 1: Generate manifest
+        log.info("[1/5] Generating manifest for skill '%s'...", name)
         manifest = await self._generate_manifest(name, description)
         errors = validate_manifest(manifest)
         if errors:
@@ -127,6 +159,7 @@ class SkillWriter:
                 error=f"Invalid manifest: {'; '.join(errors)}",
             )
 
+        log.info("[2/5] Requesting permissions...")
         # Step 2: Request permissions
         approved = await request_permissions(
             PermissionRequest(
@@ -143,14 +176,17 @@ class SkillWriter:
             )
 
         # Step 3: Generate handler + tests, test in sandbox, iterate
+        log.info("[3/5] Writing handler.py...")
         deps = manifest.get("dependencies", [])
         handler_code = await self._generate_handler(name, description, deps)
+        log.info("[4/5] Writing tests...")
         test_code = await self._generate_tests(name, description, handler_code)
 
         # Write to temp skill dir and test
         skill_dir = self.skills_dir / name
         skill_dir.mkdir(parents=True, exist_ok=True)
 
+        log.info("[5/5] Running tests in sandbox...")
         passed = await self._test_and_iterate(
             skill_dir, manifest, handler_code, test_code, description, deps,
         )
@@ -219,6 +255,9 @@ class SkillWriter:
             (skill_dir / "handler.py").write_text(handler_code)
             (skill_dir / "test_handler.py").write_text(test_code)
             (skill_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+            # Ensure pytest-asyncio is configured in the sandbox
+            (skill_dir / "conftest.py").write_text(CONFTEST_PY)
+            (skill_dir / "pytest.ini").write_text(PYTEST_INI)
 
             # Run tests in sandbox
             result = await run_in_sandbox(
@@ -229,11 +268,14 @@ class SkillWriter:
             )
 
             if result.exit_code == 0:
+                log.info("  Tests passed on attempt %d.", attempt + 1)
                 return True
 
             # Tests failed — ask LLM to fix the handler
+            error_output = result.stdout + "\n" + result.stderr
+            log.warning("  Attempt %d failed (exit code %d):\n%s", attempt + 1, result.exit_code, error_output[-1000:])
             if attempt < MAX_RETRIES - 1:
-                error_output = result.stdout + "\n" + result.stderr
+                log.info("  Asking LLM to fix handler (retry %d/%d)...", attempt + 2, MAX_RETRIES)
                 handler_code = await self._fix_handler(
                     description, handler_code, test_code, error_output, deps,
                 )

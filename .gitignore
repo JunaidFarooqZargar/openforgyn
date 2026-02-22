@@ -36,6 +36,9 @@ htmlcov/
 .DS_Store
 Thumbs.db
 
+# Secrets
+.env
+
 # Forgyn data (user-specific)
 .forgyn/
 

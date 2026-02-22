@@ -3,17 +3,35 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import shutil
 import sys
 from pathlib import Path
 
 import click
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+def _configure_logging(debug: bool = False) -> None:
+    """Set up logging. Normal mode shows skill writer progress only. Debug shows everything."""
+    if debug:
+        logging.basicConfig(level=logging.DEBUG, format="%(name)s %(levelname)s: %(message)s")
+    else:
+        # Clean output: only show skill_writer INFO+ (the [1/5]... progress lines)
+        logging.basicConfig(level=logging.WARNING, format="%(message)s")
+        logging.getLogger("forgyn.skill_writer").setLevel(logging.INFO)
+        # Suppress noisy third-party loggers
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+        logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 import forgyn
 from forgyn.db import init_db
 from forgyn.models import PROVIDER_DEFAULTS, parse_model_string
 from forgyn.reasoner import Reasoner
+from forgyn.skill_writer import SkillWriter
 
 DEFAULT_DATA_DIR = Path.home() / ".forgyn"
 DEFAULT_MODEL = "openai/gpt-4o"
@@ -36,10 +54,12 @@ def resolve_model_config(model_str: str | None):
 @click.option("--model", "-m", default=None, help="Model as provider/model (e.g. openai/gpt-4o)")
 @click.option("--data-dir", default=None, type=click.Path(), help="Data directory path")
 @click.option("--conversation-id", "-c", default=None, help="Resume a conversation by ID")
+@click.option("--debug", "-d", is_flag=True, default=False, help="Enable debug logging")
 @click.version_option(forgyn.__version__, prog_name="forgyn")
 @click.pass_context
-def main(ctx: click.Context, model: str | None, data_dir: str | None, conversation_id: str | None):
+def main(ctx: click.Context, model: str | None, data_dir: str | None, conversation_id: str | None, debug: bool):
     """Forgyn — An agent that forges its own capabilities."""
+    _configure_logging(debug)
     ctx.ensure_object(dict)
     ctx.obj["data_dir"] = Path(data_dir) if data_dir else DEFAULT_DATA_DIR
     ctx.obj["model"] = model
@@ -65,7 +85,13 @@ def chat(ctx: click.Context):
         sys.exit(1)
 
     db = init_db(db_path)
-    reasoner = Reasoner(model_config=model_config, db=db, skills_dir=skills_dir)
+    skill_writer = SkillWriter(
+        model_config=model_config,
+        db=db,
+        skills_dir=skills_dir,
+    )
+    reasoner = Reasoner(model_config=model_config, db=db, skills_dir=skills_dir, skill_writer=skill_writer)
+    reasoner.load_existing_skills()
 
     conversation_id = ctx.obj.get("conversation_id") or reasoner.new_conversation()
 
