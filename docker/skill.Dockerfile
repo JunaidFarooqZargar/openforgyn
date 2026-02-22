@@ -6,4 +6,4 @@ WORKDIR /skill
 
 USER nobody
 
-ENTRYPOINT ["python", "-m", "pytest", "-v"]
+CMD ["python", "-m", "pytest", "-v", "."]
