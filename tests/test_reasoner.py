@@ -161,3 +161,37 @@ async def test_read_file_in_skills(reasoner, skills_dir):
 async def test_read_file_not_found(reasoner):
     result = reasoner._tool_read_file({"path": "nonexistent.txt"})
     assert "Error" in result
+
+
+@pytest.mark.asyncio
+async def test_read_file_strips_skills_prefix(reasoner, skills_dir):
+    """LLMs often prepend 'skills/' — the tool should strip it."""
+    skill_dir = skills_dir / "reminder"
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "handler.py").write_text("async def run(args): pass")
+
+    # Both with and without the prefix should work
+    result_direct = reasoner._tool_read_file({"path": "reminder/handler.py"})
+    result_prefixed = reasoner._tool_read_file({"path": "skills/reminder/handler.py"})
+    assert result_direct == "async def run(args): pass"
+    assert result_prefixed == result_direct
+
+
+@pytest.mark.asyncio
+async def test_write_file_strips_skills_prefix(reasoner, skills_dir):
+    """write_file should also handle the 'skills/' prefix."""
+    reasoner._tool_write_file({"path": "skills/test_skill/config.json", "content": "{}"})
+    assert (skills_dir / "test_skill" / "config.json").read_text() == "{}"
+
+
+@pytest.mark.asyncio
+async def test_read_file_not_found_lists_existing(reasoner, skills_dir):
+    """Error message should list existing files when the directory exists."""
+    skill_dir = skills_dir / "reminder"
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "handler.py").write_text("code")
+    (skill_dir / "manifest.json").write_text("{}")
+
+    result = reasoner._tool_read_file({"path": "reminder/wrong_name.py"})
+    assert "Error" in result
+    assert "handler.py" in result

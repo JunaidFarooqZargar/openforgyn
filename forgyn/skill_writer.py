@@ -12,7 +12,7 @@ log = logging.getLogger(__name__)
 
 from forgyn.audit import commit_skill, init_skills_repo
 from forgyn.db import save_skill
-from forgyn.models import Message, ModelConfig, ToolDef, chat
+from forgyn.models import Message, ModelConfig, ToolDef, chat, web_search
 from forgyn.permissions import PermissionRequest, request_permissions, validate_manifest
 from forgyn.sandbox import run_in_sandbox
 
@@ -84,6 +84,9 @@ Requirements:
   specific values like city names, URLs with specific queries, etc.
 - Read any needed API keys from environment variables using os.environ.get()
 - Keep it simple and focused
+- NEVER generate placeholder, stub, or simulated data. If you cannot implement
+  the real functionality, return {{"result": null, "error": "Cannot implement: <reason>"}}
+  instead of faking results with sample/dummy data.
 
 Respond with ONLY the Python code, no markdown fencing, no explanation."""
 
@@ -101,6 +104,8 @@ Requirements:
 - Test at least: one success case, one edge/error case
 - Mock any external API calls or network requests
 - Keep tests focused and simple
+- Tests must validate REAL behavior, not placeholder/stub output. Never assert
+  on strings like "Sample", "placeholder", or fabricated data.
 
 Respond with ONLY the Python code, no markdown fencing, no explanation."""
 
@@ -134,8 +139,10 @@ class SkillWriter:
         db: sqlite3.Connection,
         skills_dir: Path,
         permission_prompt_fn=None,
+        code_model_config: ModelConfig | None = None,
     ):
         self.model_config = model_config
+        self.code_model = code_model_config or model_config
         self.db = db
         self.skills_dir = skills_dir
         self.permission_prompt_fn = permission_prompt_fn
@@ -175,18 +182,22 @@ class SkillWriter:
                 error="User denied permissions",
             )
 
-        # Step 3: Generate handler + tests, test in sandbox, iterate
-        log.info("[3/5] Writing handler.py...")
+        # Step 3: Research APIs if web search is available
+        log.info("[3/6] Researching APIs...")
+        research = await self._research(description)
+
+        # Step 4: Generate handler + tests, test in sandbox, iterate
+        log.info("[4/6] Writing handler.py...")
         deps = manifest.get("dependencies", [])
-        handler_code = await self._generate_handler(name, description, deps)
-        log.info("[4/5] Writing tests...")
+        handler_code = await self._generate_handler(name, description, deps, research=research)
+        log.info("[5/6] Writing tests...")
         test_code = await self._generate_tests(name, description, handler_code)
 
         # Write to temp skill dir and test
         skill_dir = self.skills_dir / name
         skill_dir.mkdir(parents=True, exist_ok=True)
 
-        log.info("[5/5] Running tests in sandbox...")
+        log.info("[6/7] Running tests in sandbox...")
         passed = await self._test_and_iterate(
             skill_dir, manifest, handler_code, test_code, description, deps,
         )
@@ -196,7 +207,16 @@ class SkillWriter:
                 error="Tests failed after maximum retries",
             )
 
-        # Step 4: Deploy — files are already written, save to DB and commit
+        # Step 7: Smoke test — run once and validate output isn't stub/fake
+        log.info("[7/7] Smoke testing output quality...")
+        smoke_ok = await self._smoke_test(name, description, handler_code, manifest)
+        if not smoke_ok:
+            return SkillWriteResult(
+                success=False, skill_name=name,
+                error="Smoke test failed: output appears to be placeholder/stub data.",
+            )
+
+        # Deploy — files are already written, save to DB and commit
         save_skill(self.db, name, manifest)
         commit_skill(
             self.skills_dir, name,
@@ -205,24 +225,101 @@ class SkillWriter:
 
         return SkillWriteResult(success=True, skill_name=name, manifest=manifest)
 
+    async def modify_skill(self, name: str, feedback: str) -> SkillWriteResult:
+        """Modify an existing skill based on user feedback, then re-test."""
+        init_skills_repo(self.skills_dir)
+        skill_dir = self.skills_dir / name
+
+        handler_path = skill_dir / "handler.py"
+        manifest_path = skill_dir / "manifest.json"
+        if not handler_path.is_file():
+            return SkillWriteResult(success=False, skill_name=name, error=f"Skill '{name}' not found.")
+
+        old_handler = handler_path.read_text()
+        manifest = json.loads(manifest_path.read_text()) if manifest_path.is_file() else {}
+        deps = manifest.get("dependencies", [])
+
+        log.info("[1/3] Rewriting handler for skill '%s'...", name)
+        prompt = (
+            f"This is the handler.py for a skill called '{name}':\n\n"
+            f"```python\n{old_handler}\n```\n\n"
+            f"The user wants this change: {feedback}\n\n"
+            f"Rewrite handler.py to address the feedback. Keep the same `async def run(args: dict) -> dict` "
+            f"signature. Available dependencies: {', '.join(deps) if deps else 'standard library only'}.\n"
+            f"Respond with ONLY the fixed Python code, no markdown fencing."
+        )
+        response = await chat(self.code_model, [Message(role="user", content=prompt)], temperature=0.3)
+        new_handler = _strip_code_fences(response.content or old_handler)
+
+        log.info("[2/3] Regenerating tests...")
+        test_code = await self._generate_tests(name, feedback, new_handler)
+
+        log.info("[3/3] Running tests in sandbox...")
+        passed = await self._test_and_iterate(skill_dir, manifest, new_handler, test_code, feedback, deps)
+        if not passed:
+            # Restore original handler on failure
+            handler_path.write_text(old_handler)
+            return SkillWriteResult(success=False, skill_name=name, error="Tests failed after retries.")
+
+        save_skill(self.db, name, manifest)
+        commit_skill(self.skills_dir, name, f"Modify skill: {name} — {feedback[:80]}")
+        return SkillWriteResult(success=True, skill_name=name, manifest=manifest)
+
+    async def _smoke_test(self, name: str, description: str, handler_code: str, manifest: dict) -> bool:
+        """Ask the LLM to evaluate if the handler code produces real or stub output."""
+        prompt = (
+            f"You are a code reviewer. This handler.py is for a skill called '{name}' "
+            f"that should: {description}\n\n"
+            f"```python\n{handler_code}\n```\n\n"
+            f"Does this code implement REAL functionality, or does it return placeholder/"
+            f"stub/simulated/fabricated data (e.g. 'Sample Title', hardcoded fake results, "
+            f"lorem ipsum, dummy data)?\n\n"
+            f"Respond with ONLY 'REAL' or 'STUB' followed by a one-sentence explanation."
+        )
+        response = await chat(
+            self.code_model,
+            [Message(role="user", content=prompt)],
+            temperature=0.0,
+        )
+        verdict = (response.content or "").strip().upper()
+        is_real = verdict.startswith("REAL")
+        if not is_real:
+            log.warning("  Smoke test failed: %s", response.content)
+        return is_real
+
     async def _generate_manifest(self, name: str, description: str) -> dict:
         """Ask the LLM to generate a skill manifest."""
         prompt = MANIFEST_PROMPT.format(name=name, description=description)
         response = await chat(
-            self.model_config,
+            self.code_model,
             [Message(role="user", content=prompt)],
             temperature=0.3,
         )
         return _extract_json(response.content or "{}")
 
-    async def _generate_handler(self, name: str, description: str, deps: list[str]) -> str:
+    async def _research(self, description: str) -> str:
+        """Search the web for API documentation relevant to the skill."""
+        query = f"Python API documentation for: {description}"
+        result = await web_search(self.model_config, query)
+        if result.get("error") or not result.get("summary"):
+            return ""
+        summary = result["summary"]
+        sources = result.get("sources", [])
+        if sources:
+            refs = "\n".join(f"- {s['title']}: {s['url']}" for s in sources[:3])
+            return f"{summary}\n\nReferences:\n{refs}"
+        return summary
+
+    async def _generate_handler(self, name: str, description: str, deps: list[str], research: str = "") -> str:
         """Ask the LLM to generate the skill handler code."""
         prompt = HANDLER_PROMPT.format(
             description=description,
             dependencies=", ".join(deps) if deps else "standard library only",
         )
+        if research:
+            prompt += f"\n\nHere is relevant API documentation from a web search:\n{research}"
         response = await chat(
-            self.model_config,
+            self.code_model,
             [Message(role="user", content=prompt)],
             temperature=0.3,
         )
@@ -232,7 +329,7 @@ class SkillWriter:
         """Ask the LLM to generate tests for the handler."""
         prompt = TEST_PROMPT.format(handler_code=handler_code)
         response = await chat(
-            self.model_config,
+            self.code_model,
             [Message(role="user", content=prompt)],
             temperature=0.3,
         )
@@ -301,7 +398,7 @@ class SkillWriter:
             f"Respond with ONLY the fixed Python code, no markdown fencing."
         )
         response = await chat(
-            self.model_config,
+            self.code_model,
             [Message(role="user", content=prompt)],
             temperature=0.3,
         )

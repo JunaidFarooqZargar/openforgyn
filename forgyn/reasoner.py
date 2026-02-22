@@ -188,6 +188,22 @@ class Reasoner:
                     "required": ["name", "description"],
                 },
             ))
+            tools.append(ToolDef(
+                name="modify_skill",
+                description=(
+                    "Modify an existing skill's handler based on feedback. Use when a skill "
+                    "is broken, returns wrong results, or needs changes. Rewrites the handler, "
+                    "regenerates tests, and re-tests in sandbox before redeploying."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "Name of the existing skill to modify"},
+                        "feedback": {"type": "string", "description": "What's wrong or what to change"},
+                    },
+                    "required": ["name", "feedback"],
+                },
+            ))
 
         for name, manifest in self._skill_tools.items():
             tools.append(ToolDef(
@@ -208,6 +224,8 @@ class Reasoner:
             return self._tool_write_file(arguments)
         elif name == "write_skill" and self.skill_writer:
             return await self._tool_write_skill(arguments)
+        elif name == "modify_skill" and self.skill_writer:
+            return await self._tool_modify_skill(arguments)
         elif name == "web_search":
             return await self._tool_web_search(arguments)
         elif name == "remember":
@@ -227,17 +245,31 @@ class Reasoner:
         lines = [f"- {s['name']} ({s['status']})" for s in skill_list]
         return "Installed skills:\n" + "\n".join(lines)
 
+    def _normalize_skill_path(self, raw_path: str) -> Path:
+        """Normalize a skill path, stripping redundant 'skills/' prefix."""
+        p = Path(raw_path)
+        # LLMs often prepend "skills/" — strip it since skills_dir already points there
+        if p.parts and p.parts[0] == "skills":
+            p = Path(*p.parts[1:])
+        return p
+
     def _tool_read_file(self, args: dict) -> str:
-        path = Path(args.get("path", ""))
+        path = self._normalize_skill_path(args.get("path", ""))
         resolved = (self.skills_dir / path).resolve()
         if not str(resolved).startswith(str(self.skills_dir.resolve())):
             return "Error: Can only read files within the skills directory."
         if not resolved.is_file():
-            return f"Error: File not found: {path}"
+            # List existing files in the target skill directory to help self-correct
+            parent = resolved.parent
+            if parent.is_dir():
+                existing = [f.name for f in parent.iterdir() if f.is_file()]
+                if existing:
+                    return f"Error: File not found: {path}. Files in {path.parent}: {', '.join(existing)}"
+            return f"Error: File not found: {path}. Use paths like: <skill_name>/handler.py"
         return resolved.read_text()
 
     def _tool_write_file(self, args: dict) -> str:
-        path = Path(args.get("path", ""))
+        path = self._normalize_skill_path(args.get("path", ""))
         content = args.get("content", "")
         resolved = (self.skills_dir / path).resolve()
         if not str(resolved).startswith(str(self.skills_dir.resolve())):
@@ -256,6 +288,17 @@ class Reasoner:
             self.register_skill(name, result.manifest)
             return f"Skill '{name}' created and deployed successfully."
         return f"Failed to create skill '{name}': {result.error}"
+
+    async def _tool_modify_skill(self, args: dict) -> str:
+        name = args.get("name", "")
+        feedback = args.get("feedback", "")
+        if not name or not feedback:
+            return "Error: modify_skill requires 'name' and 'feedback'."
+        result = await self.skill_writer.modify_skill(name, feedback)
+        if result.success:
+            self.register_skill(name, result.manifest)
+            return f"Skill '{name}' modified and redeployed successfully."
+        return f"Failed to modify skill '{name}': {result.error}"
 
     async def _tool_run_skill(self, skill_name: str, args: dict) -> str:
         """Run an installed skill by importing and calling its handler."""
@@ -353,22 +396,22 @@ BUILTIN_TOOLS = [
     ),
     ToolDef(
         name="read_file",
-        description="Read a file from the skills directory.",
+        description="Read a file from the skills directory. Path is relative to the skills root.",
         parameters={
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "Relative path within skills/"},
+                "path": {"type": "string", "description": "Relative path, e.g. 'reminder/handler.py' (NOT 'skills/reminder/handler.py')"},
             },
             "required": ["path"],
         },
     ),
     ToolDef(
         name="write_file",
-        description="Write a file to the skills directory.",
+        description="Write a file to the skills directory. Path is relative to the skills root.",
         parameters={
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "Relative path within skills/"},
+                "path": {"type": "string", "description": "Relative path, e.g. 'reminder/handler.py' (NOT 'skills/reminder/handler.py')"},
                 "content": {"type": "string", "description": "File content"},
             },
             "required": ["path", "content"],

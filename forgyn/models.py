@@ -83,8 +83,10 @@ async def chat(
     temperature: float = 0.7,
 ) -> ChatResponse:
     """Send a chat completion request to the configured provider."""
-    if config.provider == "anthropic" and not config.base_url:
+    if config.provider == "anthropic":
         return await _chat_anthropic(config, messages, tools, temperature)
+    if config.provider == "openai":
+        return await _chat_openai_responses(config, messages, tools, temperature)
     return await _chat_openai_compat(config, messages, tools, temperature)
 
 
@@ -167,6 +169,153 @@ async def _chat_openai_compat(
             raise RuntimeError(f"{config.provider} API error {e.response.status_code}: {e.response.text}")
 
     return _parse_openai_response(resp.json())
+
+
+# --- OpenAI Responses API path (default for OpenAI) ---
+
+
+def _is_reasoning_model(model: str) -> bool:
+    """Check if a model is a reasoning model that doesn't support temperature."""
+    m = model.lower()
+    # o-series reasoning models
+    if m.startswith(("o1", "o3", "o4")):
+        return True
+    if "codex" in m:
+        return True
+    # gpt-5+ mini models (reasoning-class, e.g. gpt-5-mini-2025-08-07)
+    if m.startswith("gpt-") and len(m) > 4 and m[4].isdigit() and int(m[4]) >= 5 and "mini" in m:
+        return True
+    return False
+
+
+# Keys forbidden at the top level of tool parameter schemas by the Responses API.
+_FORBIDDEN_SCHEMA_KEYS = frozenset({"oneOf", "anyOf", "allOf", "enum", "not"})
+
+
+def _sanitize_tool_parameters(params: dict) -> dict:
+    """Ensure tool parameters comply with OpenAI Responses API schema rules.
+
+    The API requires the top-level schema to have type "object" and forbids
+    oneOf/anyOf/allOf/enum/not at the top level.
+    """
+    cleaned = {k: v for k, v in params.items() if k not in _FORBIDDEN_SCHEMA_KEYS}
+    cleaned.setdefault("type", "object")
+    return cleaned
+
+
+def _build_openai_responses_request(
+    config: ModelConfig,
+    messages: list[Message],
+    tools: list[ToolDef] | None,
+    temperature: float,
+) -> dict:
+    """Build request body for OpenAI Responses API (/v1/responses)."""
+    instructions = None
+    input_items: list[dict] = []
+
+    for m in messages:
+        if m.role == "system":
+            instructions = m.content
+        elif m.role == "tool":
+            input_items.append({
+                "type": "function_call_output",
+                "call_id": m.tool_call_id,
+                "output": m.content or "",
+            })
+        elif m.role == "assistant" and m.tool_calls:
+            if m.content:
+                input_items.append({"role": "assistant", "content": m.content})
+            for tc in m.tool_calls:
+                fn = tc["function"]
+                input_items.append({
+                    "type": "function_call",
+                    "call_id": tc["id"],
+                    "name": fn["name"],
+                    "arguments": fn["arguments"] if isinstance(fn["arguments"], str) else json.dumps(fn["arguments"]),
+                })
+        else:
+            input_items.append({"role": m.role, "content": m.content or ""})
+
+    body: dict = {
+        "model": config.model,
+        "input": input_items,
+        "store": False,
+    }
+    if not _is_reasoning_model(config.model):
+        body["temperature"] = temperature
+    if instructions:
+        body["instructions"] = instructions
+    if tools:
+        body["tools"] = [
+            {
+                "type": "function",
+                "name": t.name,
+                "description": t.description,
+                "parameters": _sanitize_tool_parameters(t.parameters),
+            }
+            for t in tools
+        ]
+    return body
+
+
+def _parse_openai_responses_response(data: dict) -> ChatResponse:
+    """Parse OpenAI Responses API response into ChatResponse."""
+    content_text = None
+    tool_calls = None
+
+    for item in data.get("output", []):
+        if item.get("type") == "message":
+            for block in item.get("content", []):
+                if block.get("type") == "output_text":
+                    content_text = (content_text or "") + block.get("text", "")
+        elif item.get("type") == "function_call":
+            if tool_calls is None:
+                tool_calls = []
+            tool_calls.append({
+                "id": item["call_id"],
+                "type": "function",
+                "function": {
+                    "name": item["name"],
+                    "arguments": item["arguments"],
+                },
+            })
+
+    return ChatResponse(
+        content=content_text,
+        tool_calls=tool_calls,
+        usage=data.get("usage", {}),
+    )
+
+
+async def _chat_openai_responses(
+    config: ModelConfig,
+    messages: list[Message],
+    tools: list[ToolDef] | None,
+    temperature: float,
+) -> ChatResponse:
+    """Send a request to OpenAI Responses API (/v1/responses)."""
+    base_url = config.base_url or "https://api.openai.com/v1"
+    url = f"{base_url}/responses"
+
+    headers = {"Content-Type": "application/json"}
+    if config.api_key:
+        headers["Authorization"] = f"Bearer {config.api_key}"
+
+    body = _build_openai_responses_request(config, messages, tools, temperature)
+
+    async with httpx.AsyncClient(timeout=120) as client:
+        try:
+            resp = await client.post(url, json=body, headers=headers)
+            resp.raise_for_status()
+        except httpx.ConnectError:
+            raise ConnectionError(
+                f"Cannot connect to {config.provider} at {base_url}. "
+                f"Is the service running?"
+            )
+        except httpx.HTTPStatusError as e:
+            raise RuntimeError(f"{config.provider} API error {e.response.status_code}: {e.response.text}")
+
+    return _parse_openai_responses_response(resp.json())
 
 
 # --- Anthropic native path ---

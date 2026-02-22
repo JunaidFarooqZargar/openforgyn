@@ -95,6 +95,10 @@ async def test_empty():
     assert result["result"] == ""
 '''
 
+MOCK_SMOKE_PASS = "REAL — This handler echoes the input back, which is real functionality."
+
+MOCK_WEB_SEARCH_RESULT = {"summary": "", "sources": []}
+
 
 def _make_chat_sequence(responses: list[str]):
     """Create a mock chat function that returns responses in order."""
@@ -142,13 +146,18 @@ async def test_full_write_flow_mocked(writer, skills_dir):
     """Full flow with mocked LLM and mocked sandbox (no Docker needed)."""
     from forgyn.sandbox import SandboxResult
 
-    mock_chat = _make_chat_sequence([MOCK_MANIFEST, MOCK_HANDLER, MOCK_TESTS])
+    # Sequence: manifest, handler, tests, smoke test
+    mock_chat = _make_chat_sequence([MOCK_MANIFEST, MOCK_HANDLER, MOCK_TESTS, MOCK_SMOKE_PASS])
 
     async def mock_sandbox(*args, **kwargs):
         return SandboxResult(exit_code=0, stdout="1 passed", stderr="")
 
+    async def mock_ws(*args, **kwargs):
+        return MOCK_WEB_SEARCH_RESULT
+
     with patch("forgyn.skill_writer.chat", new=mock_chat), \
-         patch("forgyn.skill_writer.run_in_sandbox", new=mock_sandbox):
+         patch("forgyn.skill_writer.run_in_sandbox", new=mock_sandbox), \
+         patch("forgyn.skill_writer.web_search", new=mock_ws):
         result = await writer.write_skill("echo", "Echoes input back")
 
     assert result.success is True
@@ -196,13 +205,17 @@ async def test_test_failure_retries(writer, skills_dir):
             return SandboxResult(exit_code=1, stdout="FAILED", stderr="assertion error")
         return SandboxResult(exit_code=0, stdout="1 passed", stderr="")
 
-    # LLM calls: manifest, handler, tests, fix1, fix2
+    # LLM calls: manifest, handler, tests, fix1, fix2, smoke test
     mock_chat = _make_chat_sequence([
-        MOCK_MANIFEST, MOCK_HANDLER, MOCK_TESTS, MOCK_HANDLER, MOCK_HANDLER,
+        MOCK_MANIFEST, MOCK_HANDLER, MOCK_TESTS, MOCK_HANDLER, MOCK_HANDLER, MOCK_SMOKE_PASS,
     ])
 
+    async def mock_ws(*args, **kwargs):
+        return MOCK_WEB_SEARCH_RESULT
+
     with patch("forgyn.skill_writer.chat", new=mock_chat), \
-         patch("forgyn.skill_writer.run_in_sandbox", new=mock_sandbox):
+         patch("forgyn.skill_writer.run_in_sandbox", new=mock_sandbox), \
+         patch("forgyn.skill_writer.web_search", new=mock_ws):
         result = await writer.write_skill("echo", "Echoes input")
 
     assert result.success is True
@@ -222,8 +235,12 @@ async def test_test_failure_aborts_after_max(writer, skills_dir):
         MOCK_HANDLER, MOCK_HANDLER,  # fix attempts
     ])
 
+    async def mock_ws(*args, **kwargs):
+        return MOCK_WEB_SEARCH_RESULT
+
     with patch("forgyn.skill_writer.chat", new=mock_chat), \
-         patch("forgyn.skill_writer.run_in_sandbox", new=mock_sandbox):
+         patch("forgyn.skill_writer.run_in_sandbox", new=mock_sandbox), \
+         patch("forgyn.skill_writer.web_search", new=mock_ws):
         result = await writer.write_skill("echo", "Echoes input")
 
     assert result.success is False
@@ -235,13 +252,17 @@ async def test_skill_saved_to_db(writer, db, skills_dir):
     """After successful write, skill should be in the database."""
     from forgyn.sandbox import SandboxResult
 
-    mock_chat = _make_chat_sequence([MOCK_MANIFEST, MOCK_HANDLER, MOCK_TESTS])
+    mock_chat = _make_chat_sequence([MOCK_MANIFEST, MOCK_HANDLER, MOCK_TESTS, MOCK_SMOKE_PASS])
 
     async def mock_sandbox(*args, **kwargs):
         return SandboxResult(exit_code=0, stdout="1 passed", stderr="")
 
+    async def mock_ws(*args, **kwargs):
+        return MOCK_WEB_SEARCH_RESULT
+
     with patch("forgyn.skill_writer.chat", new=mock_chat), \
-         patch("forgyn.skill_writer.run_in_sandbox", new=mock_sandbox):
+         patch("forgyn.skill_writer.run_in_sandbox", new=mock_sandbox), \
+         patch("forgyn.skill_writer.web_search", new=mock_ws):
         await writer.write_skill("echo", "Echoes input")
 
     skill = get_skill(db, "echo")
@@ -255,15 +276,88 @@ async def test_audit_commit_created(writer, skills_dir):
     from forgyn.sandbox import SandboxResult
     from forgyn.audit import get_skill_history
 
-    mock_chat = _make_chat_sequence([MOCK_MANIFEST, MOCK_HANDLER, MOCK_TESTS])
+    mock_chat = _make_chat_sequence([MOCK_MANIFEST, MOCK_HANDLER, MOCK_TESTS, MOCK_SMOKE_PASS])
+
+    async def mock_sandbox(*args, **kwargs):
+        return SandboxResult(exit_code=0, stdout="1 passed", stderr="")
+
+    async def mock_ws(*args, **kwargs):
+        return MOCK_WEB_SEARCH_RESULT
+
+    with patch("forgyn.skill_writer.chat", new=mock_chat), \
+         patch("forgyn.skill_writer.run_in_sandbox", new=mock_sandbox), \
+         patch("forgyn.skill_writer.web_search", new=mock_ws):
+        await writer.write_skill("echo", "Echoes input")
+
+    history = get_skill_history(skills_dir, "echo")
+    assert len(history) >= 1
+    assert "echo" in history[0]["message"].lower()
+
+
+# --- Smoke test ---
+
+
+@pytest.mark.asyncio
+async def test_smoke_test_rejects_stub(writer, skills_dir):
+    """Smoke test should reject skills with stub/placeholder output."""
+    from forgyn.sandbox import SandboxResult
+
+    mock_chat = _make_chat_sequence([
+        MOCK_MANIFEST, MOCK_HANDLER, MOCK_TESTS,
+        "STUB — This handler returns hardcoded fake data.",
+    ])
+
+    async def mock_sandbox(*args, **kwargs):
+        return SandboxResult(exit_code=0, stdout="1 passed", stderr="")
+
+    async def mock_ws(*args, **kwargs):
+        return MOCK_WEB_SEARCH_RESULT
+
+    with patch("forgyn.skill_writer.chat", new=mock_chat), \
+         patch("forgyn.skill_writer.run_in_sandbox", new=mock_sandbox), \
+         patch("forgyn.skill_writer.web_search", new=mock_ws):
+        result = await writer.write_skill("fake", "Something fake")
+
+    assert result.success is False
+    assert "smoke test" in result.error.lower()
+
+
+# --- Modify skill ---
+
+
+@pytest.mark.asyncio
+async def test_modify_skill(writer, skills_dir):
+    """modify_skill should rewrite handler, re-test, and redeploy."""
+    from forgyn.sandbox import SandboxResult
+
+    # First, create the skill files manually
+    skill_dir = skills_dir / "echo"
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "handler.py").write_text(MOCK_HANDLER)
+    (skill_dir / "manifest.json").write_text(MOCK_MANIFEST)
+
+    new_handler = '''\
+async def run(args: dict) -> dict:
+    text = args.get("text", "")
+    return {"result": text.upper(), "error": None}
+'''
+    # Sequence: rewritten handler, tests
+    mock_chat = _make_chat_sequence([new_handler, MOCK_TESTS])
 
     async def mock_sandbox(*args, **kwargs):
         return SandboxResult(exit_code=0, stdout="1 passed", stderr="")
 
     with patch("forgyn.skill_writer.chat", new=mock_chat), \
          patch("forgyn.skill_writer.run_in_sandbox", new=mock_sandbox):
-        await writer.write_skill("echo", "Echoes input")
+        result = await writer.modify_skill("echo", "Make it uppercase")
 
-    history = get_skill_history(skills_dir, "echo")
-    assert len(history) >= 1
-    assert "echo" in history[0]["message"].lower()
+    assert result.success is True
+    assert "upper()" in (skill_dir / "handler.py").read_text()
+
+
+@pytest.mark.asyncio
+async def test_modify_nonexistent_skill(writer):
+    """modify_skill should fail gracefully for missing skills."""
+    result = await writer.modify_skill("nonexistent", "fix it")
+    assert result.success is False
+    assert "not found" in result.error.lower()

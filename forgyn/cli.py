@@ -15,17 +15,38 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-def _configure_logging(debug: bool = False) -> None:
+def _configure_logging(debug: bool = False, log_file: str | None = None) -> None:
     """Set up logging. Normal mode shows skill writer progress only. Debug shows everything."""
-    if debug:
-        logging.basicConfig(level=logging.DEBUG, format="%(name)s %(levelname)s: %(message)s")
-    else:
-        # Clean output: only show skill_writer INFO+ (the [1/5]... progress lines)
-        logging.basicConfig(level=logging.WARNING, format="%(message)s")
+    fmt = "%(asctime)s %(name)s %(levelname)s: %(message)s" if log_file else "%(name)s %(levelname)s: %(message)s"
+    handlers: list[logging.Handler] = []
+
+    if log_file:
+        # All debug output goes to file, terminal stays clean
+        file_handler = logging.FileHandler(log_file, mode="a")
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(logging.Formatter(fmt))
+        handlers.append(file_handler)
+
+    if debug and not log_file:
+        # Debug to terminal only when no log file is set
+        handlers.append(logging.StreamHandler())
+
+    if not debug and not log_file:
+        # Normal mode: skill writer progress to terminal
+        handlers.append(logging.StreamHandler())
+
+    logging.basicConfig(
+        level=logging.DEBUG if (debug or log_file) else logging.WARNING,
+        format=fmt,
+        handlers=handlers,
+    )
+
+    if not debug and not log_file:
         logging.getLogger("forgyn.skill_writer").setLevel(logging.INFO)
-        # Suppress noisy third-party loggers
-        logging.getLogger("httpx").setLevel(logging.WARNING)
-        logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+    # Suppress noisy third-party loggers
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 import forgyn
 from forgyn.db import init_db
@@ -52,17 +73,20 @@ def resolve_model_config(model_str: str | None):
 
 @click.group(invoke_without_command=True)
 @click.option("--model", "-m", default=None, help="Model as provider/model (e.g. openai/gpt-4o)")
+@click.option("--code-model", default=None, help="Model for code generation (e.g. openai/o3). Falls back to --model.")
 @click.option("--data-dir", default=None, type=click.Path(), help="Data directory path")
 @click.option("--conversation-id", "-c", default=None, help="Resume a conversation by ID")
 @click.option("--debug", "-d", is_flag=True, default=False, help="Enable debug logging")
+@click.option("--log-file", default=None, type=click.Path(), help="Write debug logs to file instead of terminal")
 @click.version_option(forgyn.__version__, prog_name="forgyn")
 @click.pass_context
-def main(ctx: click.Context, model: str | None, data_dir: str | None, conversation_id: str | None, debug: bool):
+def main(ctx: click.Context, model: str | None, code_model: str | None, data_dir: str | None, conversation_id: str | None, debug: bool, log_file: str | None):
     """Forgyn — An agent that forges its own capabilities."""
-    _configure_logging(debug)
+    _configure_logging(debug, log_file)
     ctx.ensure_object(dict)
     ctx.obj["data_dir"] = Path(data_dir) if data_dir else DEFAULT_DATA_DIR
     ctx.obj["model"] = model
+    ctx.obj["code_model"] = code_model
     ctx.obj["conversation_id"] = conversation_id
 
     if ctx.invoked_subcommand is None:
@@ -92,10 +116,14 @@ def chat(ctx: click.Context):
     if expired:
         logging.getLogger(__name__).debug("Cleaned up %d expired memories", expired)
 
+    code_model_str = ctx.obj.get("code_model") or os.environ.get("FORGYN_CODE_MODEL")
+    code_model_config = parse_model_string(code_model_str) if code_model_str else None
+
     skill_writer = SkillWriter(
         model_config=model_config,
         db=db,
         skills_dir=skills_dir,
+        code_model_config=code_model_config,
     )
     reasoner = Reasoner(model_config=model_config, db=db, skills_dir=skills_dir, skill_writer=skill_writer)
     reasoner.load_existing_skills()

@@ -245,14 +245,26 @@ Skills with no permissions are auto-approved. Everything else requires explicit 
 ```bash
 forgyn                              # Interactive chat
 forgyn --model ollama/llama3        # Use a specific model
+forgyn --code-model openai/o3       # Use a stronger model for code generation
 forgyn -c <conversation-id>        # Resume a conversation
 
 forgyn skills                       # List installed skills
+forgyn memories                     # List stored memories
 forgyn doctor                       # Check Python, Docker, API keys
 forgyn history                      # Recent conversations
 forgyn rollback <skill> <commit>    # Revert a skill to a previous version
 
 forgyn --version
+```
+
+### Debug Logging
+
+```bash
+# Logs all debug output to file, terminal stays clean
+uv run forgyn --log-file forgyn_debug.log
+
+# You can tail it in another terminal while testing
+tail -f forgyn_debug.log
 ```
 
 ## Development
