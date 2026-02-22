@@ -13,7 +13,7 @@ from forgyn.db import (
     add_message, create_conversation, get_messages, get_memories_with_embeddings,
     list_memories, list_skills, save_memory, delete_memory,
 )
-from forgyn.models import Message, ModelConfig, ToolDef, chat, embed
+from forgyn.models import Message, ModelConfig, ToolDef, chat, embed, web_search
 
 log = logging.getLogger(__name__)
 
@@ -208,6 +208,8 @@ class Reasoner:
             return self._tool_write_file(arguments)
         elif name == "write_skill" and self.skill_writer:
             return await self._tool_write_skill(arguments)
+        elif name == "web_search":
+            return await self._tool_web_search(arguments)
         elif name == "remember":
             return await self._tool_remember(arguments)
         elif name == "forget":
@@ -275,6 +277,20 @@ class Reasoner:
             return json.dumps(result)
         except Exception as e:
             return f"Error running skill '{skill_name}': {e}"
+
+    async def _tool_web_search(self, args: dict) -> str:
+        query = args.get("query", "")
+        if not query:
+            return "Error: web_search requires 'query'."
+        result = await web_search(self.model_config, query)
+        if result.get("error"):
+            return f"Web search failed: {result['error']}"
+        summary = result.get("summary", "No results found.")
+        sources = result.get("sources", [])
+        if sources:
+            source_lines = "\n".join(f"- [{s['title']}]({s['url']})" for s in sources)
+            return f"{summary}\n\nSources:\n{source_lines}"
+        return summary
 
     async def _tool_remember(self, args: dict) -> str:
         key = args.get("key", "")
@@ -356,6 +372,20 @@ BUILTIN_TOOLS = [
                 "content": {"type": "string", "description": "File content"},
             },
             "required": ["path", "content"],
+        },
+    ),
+    ToolDef(
+        name="web_search",
+        description=(
+            "Search the web for current information. Use when you need up-to-date "
+            "facts, news, documentation, or anything beyond your training data."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "The search query"},
+            },
+            "required": ["query"],
         },
     ),
     ToolDef(

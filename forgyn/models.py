@@ -287,6 +287,104 @@ async def embed(config: ModelConfig, text: str) -> list[float]:
     return data.get("data", [{}])[0].get("embedding", [])
 
 
+# --- Web Search ---
+
+
+async def web_search(config: ModelConfig, query: str) -> dict:
+    """Search the web using the LLM provider's native search capability.
+
+    Returns {"summary": str, "sources": [{"title": str, "url": str}]}.
+    Falls back gracefully for providers without web search.
+    """
+    if config.provider == "openai":
+        return await _web_search_openai(config, query)
+    if config.provider == "anthropic":
+        return await _web_search_anthropic(config, query)
+    return {"summary": "", "sources": [], "error": f"Web search not available for {config.provider}"}
+
+
+async def _web_search_openai(config: ModelConfig, query: str) -> dict:
+    """Web search via OpenAI Responses API with web_search_preview tool."""
+    base_url = config.base_url or "https://api.openai.com/v1"
+    url = f"{base_url}/responses"
+
+    headers = {"Content-Type": "application/json"}
+    if config.api_key:
+        headers["Authorization"] = f"Bearer {config.api_key}"
+
+    body = {
+        "model": config.model,
+        "tools": [{"type": "web_search_preview"}],
+        "input": query,
+    }
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        try:
+            resp = await client.post(url, json=body, headers=headers)
+            resp.raise_for_status()
+        except Exception as e:
+            return {"summary": "", "sources": [], "error": str(e)}
+
+    data = resp.json()
+    summary = ""
+    sources = []
+    seen_urls = set()
+    for output in data.get("output", []):
+        if output.get("type") == "message":
+            for block in output.get("content", []):
+                if block.get("type") == "output_text":
+                    summary += block.get("text", "")
+                    for ann in block.get("annotations", []):
+                        if ann.get("type") == "url_citation":
+                            u = ann.get("url", "")
+                            if u and u not in seen_urls:
+                                seen_urls.add(u)
+                                sources.append({"title": ann.get("title", ""), "url": u})
+    return {"summary": summary, "sources": sources}
+
+
+async def _web_search_anthropic(config: ModelConfig, query: str) -> dict:
+    """Web search via Anthropic Messages API with server-side web_search tool."""
+    base_url = config.base_url or "https://api.anthropic.com"
+    url = f"{base_url}/v1/messages"
+
+    headers = {
+        "Content-Type": "application/json",
+        "x-api-key": config.api_key or "",
+        "anthropic-version": "2025-03-05",
+    }
+
+    body = {
+        "model": config.model,
+        "max_tokens": 4096,
+        "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}],
+        "messages": [{"role": "user", "content": f"Search the web for: {query}"}],
+    }
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        try:
+            resp = await client.post(url, json=body, headers=headers)
+            resp.raise_for_status()
+        except Exception as e:
+            return {"summary": "", "sources": [], "error": str(e)}
+
+    data = resp.json()
+    summary = ""
+    sources = []
+    seen_urls = set()
+    for block in data.get("content", []):
+        if block.get("type") == "text":
+            summary += block.get("text", "")
+        elif block.get("type") == "web_search_tool_result":
+            for result in block.get("content", []):
+                if result.get("type") == "web_search_result":
+                    u = result.get("url", "")
+                    if u and u not in seen_urls:
+                        seen_urls.add(u)
+                        sources.append({"title": result.get("title", ""), "url": u})
+    return {"summary": summary, "sources": sources}
+
+
 async def _chat_anthropic(
     config: ModelConfig,
     messages: list[Message],
