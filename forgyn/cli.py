@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -11,7 +12,7 @@ import click
 
 import forgyn
 from forgyn.db import init_db
-from forgyn.models import ModelConfig, parse_model_string
+from forgyn.models import PROVIDER_DEFAULTS, parse_model_string
 from forgyn.reasoner import Reasoner
 
 DEFAULT_DATA_DIR = Path.home() / ".forgyn"
@@ -25,7 +26,7 @@ def ensure_data_dir(data_dir: Path) -> Path:
     return data_dir
 
 
-def resolve_model_config(model_str: str | None) -> ModelConfig:
+def resolve_model_config(model_str: str | None):
     """Build ModelConfig from CLI flag or environment."""
     model_str = model_str or os.environ.get("FORGYN_MODEL", DEFAULT_MODEL)
     return parse_model_string(model_str)
@@ -113,3 +114,106 @@ def skills(ctx: click.Context):
     click.echo("-" * 50)
     for s in skill_list:
         click.echo(f"{s['name']:<20} {s['status']:<10} {s['created_at']}")
+
+
+@main.command()
+@click.pass_context
+def doctor(ctx: click.Context):
+    """Check system health: Python, Docker, API keys, data directory."""
+    ok_count = 0
+    total = 0
+
+    def check(label: str, passed: bool, detail: str = ""):
+        nonlocal ok_count, total
+        total += 1
+        status = "OK" if passed else "FAIL"
+        if passed:
+            ok_count += 1
+        msg = f"  [{status}] {label}"
+        if detail:
+            msg += f" — {detail}"
+        click.echo(msg)
+
+    click.echo(f"Forgyn v{forgyn.__version__} — System Check\n")
+
+    # Python version
+    v = sys.version_info
+    check("Python", v >= (3, 12), f"{v.major}.{v.minor}.{v.micro}")
+
+    # Docker
+    docker_available = shutil.which("docker") is not None
+    if docker_available:
+        import subprocess
+        result = subprocess.run(["docker", "info"], capture_output=True, timeout=10)
+        docker_running = result.returncode == 0
+    else:
+        docker_running = False
+    check("Docker installed", docker_available)
+    check("Docker running", docker_running)
+
+    # API keys
+    for provider, defaults in PROVIDER_DEFAULTS.items():
+        key_env = defaults.get("key_env")
+        if key_env:
+            has_key = bool(os.environ.get(key_env))
+            check(f"{provider} API key ({key_env})", has_key, "set" if has_key else "not set")
+
+    # Data directory
+    data_dir = ctx.obj["data_dir"]
+    check("Data directory", data_dir.exists(), str(data_dir))
+
+    # Skills directory
+    skills_dir = data_dir / "skills"
+    check("Skills directory", skills_dir.exists(), str(skills_dir))
+
+    click.echo(f"\n{ok_count}/{total} checks passed.")
+
+
+@main.command()
+@click.pass_context
+def history(ctx: click.Context):
+    """Show recent conversations."""
+    data_dir = ensure_data_dir(ctx.obj["data_dir"])
+    db = init_db(data_dir / "forgyn.db")
+
+    rows = db.execute(
+        "SELECT id, title, created_at FROM conversations ORDER BY created_at DESC LIMIT 20"
+    ).fetchall()
+
+    if not rows:
+        click.echo("No conversations yet.")
+        return
+
+    click.echo(f"{'ID':<38} {'Title':<25} {'Created'}")
+    click.echo("-" * 80)
+    for r in rows:
+        title = r["title"] or "(untitled)"
+        click.echo(f"{r['id']:<38} {title:<25} {r['created_at']}")
+
+
+@main.command()
+@click.argument("skill_name")
+@click.argument("commit_hash")
+@click.pass_context
+def rollback(ctx: click.Context, skill_name: str, commit_hash: str):
+    """Rollback a skill to a previous version. Usage: forgyn rollback <skill> <commit>"""
+    data_dir = ensure_data_dir(ctx.obj["data_dir"])
+    skills_dir = data_dir / "skills"
+
+    from forgyn.audit import get_skill_history, rollback_skill
+
+    hist = get_skill_history(skills_dir, skill_name)
+    if not hist:
+        click.echo(f"No history found for skill '{skill_name}'.")
+        return
+
+    valid_hashes = [h["hash"] for h in hist]
+    if commit_hash not in valid_hashes:
+        click.echo(f"Commit {commit_hash} not found in history for '{skill_name}'.")
+        click.echo("Available commits:")
+        for h in hist:
+            click.echo(f"  {h['hash'][:12]}  {h['date']}  {h['message']}")
+        return
+
+    rollback_skill(skills_dir, skill_name, commit_hash)
+    click.echo(f"Rolled back '{skill_name}' to commit {commit_hash[:12]}.")
