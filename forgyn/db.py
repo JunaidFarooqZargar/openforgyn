@@ -95,6 +95,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
     cols = {row[1] for row in conn.execute("PRAGMA table_info(schedules)").fetchall()}
     if "message" not in cols:
         conn.execute("ALTER TABLE schedules ADD COLUMN message TEXT")
+    if "channel" not in cols:
+        conn.execute("ALTER TABLE schedules ADD COLUMN channel TEXT")
+    if "recipient" not in cols:
+        conn.execute("ALTER TABLE schedules ADD COLUMN recipient TEXT")
     # Ensure the _system pseudo-skill exists for message-only schedules (reminders)
     conn.execute(
         "INSERT OR IGNORE INTO skills (name, status, manifest, created_at, updated_at)"
@@ -196,15 +200,25 @@ def save_schedule(
     schedule_value: str,
     next_run: str | None,
     message: str | None = None,
+    channel: str | None = None,
+    recipient: str | None = None,
 ) -> int:
     """Create a schedule. Returns the schedule row ID."""
     cur = db.execute(
-        "INSERT INTO schedules (skill_name, schedule_type, schedule_value, next_run, message, status, created_at)"
-        " VALUES (?, ?, ?, ?, ?, 'active', ?)",
-        (skill_name, schedule_type, schedule_value, next_run, message, _now()),
+        "INSERT INTO schedules (skill_name, schedule_type, schedule_value, next_run, message, channel, recipient, status, created_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?)",
+        (skill_name, schedule_type, schedule_value, next_run, message, channel, recipient, _now()),
     )
     db.commit()
     return cur.lastrowid
+
+
+def list_schedules(db: sqlite3.Connection) -> list[dict]:
+    """List all schedules (active, completed, paused)."""
+    rows = db.execute(
+        "SELECT * FROM schedules ORDER BY created_at DESC"
+    ).fetchall()
+    return [_row_to_dict(r) for r in rows]
 
 
 def get_due_schedules(db: sqlite3.Connection) -> list[dict]:

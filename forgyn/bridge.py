@@ -63,6 +63,12 @@ class Bridge:
         rows = drain_outbox(self.db, channel_name)
         return [r["text"] for r in rows]
 
+    def drain_full(self, channel_name: str | None = None) -> list[dict]:
+        """Fetch pending outbox messages with full metadata (text, recipient, channel)."""
+        if self.db is None:
+            return []
+        return drain_outbox(self.db, channel_name)
+
     async def start(self) -> None:
         """Connect all registered channels."""
         for ch in self.channels.values():

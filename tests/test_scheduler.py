@@ -172,7 +172,7 @@ async def test_scheduler_pushes_to_outbox(db):
     async def mock_execute(skill_name, args):
         return "Result from skill"
 
-    async def mock_push(text):
+    async def mock_push(text, channel=None, recipient=None):
         pushed.append(text)
 
     sched = Scheduler(db=db, execute_fn=mock_execute, push_fn=mock_push)
@@ -189,7 +189,7 @@ async def test_scheduler_pushes_message_without_execute(db):
     """A schedule with a message should push directly without calling execute_fn."""
     pushed = []
 
-    async def mock_push(text):
+    async def mock_push(text, channel=None, recipient=None):
         pushed.append(text)
 
     sched = Scheduler(db=db, push_fn=mock_push)

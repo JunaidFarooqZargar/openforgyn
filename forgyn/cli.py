@@ -80,9 +80,10 @@ def resolve_model_config(model_str: str | None):
 @click.option("--conversation-id", "-c", default=None, help="Resume a conversation by ID")
 @click.option("--debug", "-d", is_flag=True, default=False, help="Enable debug logging")
 @click.option("--log-file", default=None, type=click.Path(), help="Write debug logs to file instead of terminal")
+@click.option("--yes", "-y", is_flag=True, default=False, help="Auto-approve all permission requests")
 @click.version_option(forgyn.__version__, prog_name="forgyn")
 @click.pass_context
-def main(ctx: click.Context, model: str | None, code_model: str | None, data_dir: str | None, conversation_id: str | None, debug: bool, log_file: str | None):
+def main(ctx: click.Context, model: str | None, code_model: str | None, data_dir: str | None, conversation_id: str | None, debug: bool, log_file: str | None, yes: bool):
     """Forgyn — An agent that forges its own capabilities."""
     _configure_logging(debug, log_file)
     ctx.ensure_object(dict)
@@ -90,18 +91,21 @@ def main(ctx: click.Context, model: str | None, code_model: str | None, data_dir
     ctx.obj["model"] = model
     ctx.obj["code_model"] = code_model
     ctx.obj["conversation_id"] = conversation_id
+    ctx.obj["auto_approve"] = yes
 
     if ctx.invoked_subcommand is None:
         ctx.invoke(chat)
 
 
-@main.command()
-@click.pass_context
-def chat(ctx: click.Context):
-    """Start an interactive chat session with Forgyn."""
+def _build_runtime(ctx: click.Context):
+    """Shared setup: db, model, skill writer, scheduler, reasoner."""
     data_dir = ensure_data_dir(ctx.obj["data_dir"])
-    db_path = data_dir / "forgyn.db"
-    skills_dir = data_dir / "skills"
+    db = init_db(data_dir / "forgyn.db")
+
+    from forgyn.db import delete_expired_memories
+    expired = delete_expired_memories(db)
+    if expired:
+        logging.getLogger(__name__).debug("Cleaned up %d expired memories", expired)
 
     try:
         model_config = resolve_model_config(ctx.obj.get("model"))
@@ -110,23 +114,25 @@ def chat(ctx: click.Context):
         click.echo("Set FORGYN_MODEL (e.g. openai/gpt-4o) and the matching API key.", err=True)
         sys.exit(1)
 
-    db = init_db(db_path)
-
-    # Clean up expired memories on session start
-    from forgyn.db import delete_expired_memories
-    expired = delete_expired_memories(db)
-    if expired:
-        logging.getLogger(__name__).debug("Cleaned up %d expired memories", expired)
-
     code_model_str = ctx.obj.get("code_model") or os.environ.get("FORGYN_CODE_MODEL")
     code_model_config = parse_model_string(code_model_str) if code_model_str else None
 
+    auto_approve = ctx.obj.get("auto_approve", False)
+    permission_fn = (lambda prompt: "y") if auto_approve else None
+
     skill_writer = SkillWriter(
-        model_config=model_config,
-        db=db,
-        skills_dir=skills_dir,
-        code_model_config=code_model_config,
+        model_config=model_config, db=db, skills_dir=data_dir / "skills",
+        code_model_config=code_model_config, permission_prompt_fn=permission_fn,
     )
+
+    return data_dir, db, model_config, skill_writer
+
+
+@main.command()
+@click.pass_context
+def chat(ctx: click.Context):
+    """Start an interactive chat session with Forgyn."""
+    data_dir, db, model_config, skill_writer = _build_runtime(ctx)
 
     bridge = Bridge(db=db)
     bridge.register_channel(CLIChannel())
@@ -134,7 +140,7 @@ def chat(ctx: click.Context):
     scheduler = Scheduler(db=db, push_fn=bridge.push)
 
     reasoner = Reasoner(
-        model_config=model_config, db=db, skills_dir=skills_dir,
+        model_config=model_config, db=db, skills_dir=data_dir / "skills",
         skill_writer=skill_writer, scheduler=scheduler,
     )
     reasoner.load_existing_skills()
@@ -178,10 +184,70 @@ async def _chat_loop(reasoner: Reasoner, bridge: Bridge, conversation_id: str):
             break
 
         try:
-            response = await reasoner.run(conversation_id, user_input)
+            response = await reasoner.run(conversation_id, user_input, channel="cli")
             click.echo(f"\n{response}\n")
         except Exception as e:
             click.echo(f"\nError: {e}\n", err=True)
+
+
+@main.command()
+@click.pass_context
+def telegram(ctx: click.Context):
+    """Start Forgyn as a Telegram bot."""
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    if not token:
+        click.echo("Error: TELEGRAM_BOT_TOKEN environment variable is required.", err=True)
+        click.echo("Create a bot via @BotFather on Telegram and set the token.", err=True)
+        sys.exit(1)
+
+    data_dir, db, model_config, skill_writer = _build_runtime(ctx)
+
+    conversations: dict[str, str] = {}  # chat_id -> conversation_id
+
+    reasoner = Reasoner(
+        model_config=model_config, db=db, skills_dir=data_dir / "skills",
+        skill_writer=skill_writer, scheduler=None,
+    )
+    reasoner.load_existing_skills()
+
+    async def on_message(sender: str, text: str) -> str:
+        if sender not in conversations:
+            conversations[sender] = reasoner.new_conversation()
+        return await reasoner.run(
+            conversations[sender], text, channel="telegram", recipient=sender,
+        )
+
+    bridge = Bridge(on_message_fn=on_message, db=db)
+
+    from forgyn.telegram import TelegramChannel
+    tg_channel = TelegramChannel(token)
+    bridge.register_channel(tg_channel)
+    tg_channel.set_bridge(bridge)
+
+    scheduler = Scheduler(db=db, push_fn=bridge.push)
+
+    # Wire scheduler into reasoner after both exist
+    reasoner.scheduler = scheduler
+
+    click.echo(f"Forgyn v{forgyn.__version__} — Telegram mode")
+    click.echo(f"Model: {model_config.provider}/{model_config.model}")
+    click.echo("Press Ctrl+C to stop.\n")
+
+    asyncio.run(_telegram_loop(scheduler, bridge))
+
+
+async def _telegram_loop(scheduler: Scheduler, bridge: Bridge):
+    """Run Telegram bot until interrupted."""
+    await bridge.start()
+    await scheduler.start()
+    try:
+        while True:
+            await asyncio.sleep(1)
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        pass
+    finally:
+        await scheduler.stop()
+        await bridge.stop()
 
 
 @main.command()

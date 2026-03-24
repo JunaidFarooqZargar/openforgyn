@@ -55,13 +55,18 @@ class Scheduler:
         schedule_type: str,
         schedule_value: str,
         message: str | None = None,
+        channel: str | None = None,
+        recipient: str | None = None,
     ) -> int:
         """Register a new schedule. Returns the schedule ID."""
         if schedule_type == "once":
             next_run = schedule_value  # The value IS the run time
         else:
             next_run = compute_next_run(schedule_type, schedule_value)
-        return save_schedule(self.db, skill_name, schedule_type, schedule_value, next_run, message=message)
+        return save_schedule(
+            self.db, skill_name, schedule_type, schedule_value, next_run,
+            message=message, channel=channel, recipient=recipient,
+        )
 
     def cancel(self, schedule_id: int) -> None:
         """Cancel a schedule by marking it paused."""
@@ -77,7 +82,11 @@ class Scheduler:
                 if not text and self.execute_fn:
                     text = await self.execute_fn(sched["skill_name"], {})
                 if self.push_fn and text:
-                    await self.push_fn(text)
+                    await self.push_fn(
+                        text,
+                        channel=sched.get("channel"),
+                        recipient=sched.get("recipient"),
+                    )
                 fired += 1
             except Exception as e:
                 log.error("Schedule %s failed: %s", sched["id"], e)

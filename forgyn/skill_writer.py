@@ -216,6 +216,11 @@ class SkillWriter:
                 error="Smoke test failed: output appears to be placeholder/stub data.",
             )
 
+        # Install dependencies into the host environment so the skill can run in-process
+        deps = manifest.get("dependencies", [])
+        if deps:
+            await self._install_deps(deps)
+
         # Deploy — files are already written, save to DB and commit
         save_skill(self.db, name, manifest)
         commit_skill(
@@ -261,9 +266,30 @@ class SkillWriter:
             handler_path.write_text(old_handler)
             return SkillWriteResult(success=False, skill_name=name, error="Tests failed after retries.")
 
+        if deps:
+            await self._install_deps(deps)
+
         save_skill(self.db, name, manifest)
         commit_skill(self.skills_dir, name, f"Modify skill: {name} — {feedback[:80]}")
         return SkillWriteResult(success=True, skill_name=name, manifest=manifest)
+
+    @staticmethod
+    async def _install_deps(deps: list[str]) -> None:
+        """Install skill dependencies into the host environment."""
+        import shutil
+        import subprocess
+        import sys
+        # Prefer uv (fast, used by this project) over pip
+        uv = shutil.which("uv")
+        if uv:
+            cmd = [uv, "pip", "install", "--quiet", *deps]
+        else:
+            cmd = [sys.executable, "-m", "pip", "install", "--quiet", *deps]
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, timeout=60)
+            log.info("Installed dependencies: %s", ", ".join(deps))
+        except subprocess.CalledProcessError as e:
+            log.warning("Failed to install deps %s: %s", deps, e.stderr.decode()[-200:])
 
     async def _smoke_test(self, name: str, description: str, handler_code: str, manifest: dict) -> bool:
         """Ask the LLM to evaluate if the handler code produces real or stub output."""

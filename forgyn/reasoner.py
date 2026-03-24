@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 
 import math
@@ -19,8 +20,9 @@ log = logging.getLogger(__name__)
 
 MAX_TOOL_ITERATIONS = 10
 
-SYSTEM_PROMPT = """\
+SYSTEM_PROMPT_TEMPLATE = """\
 You are Forgyn, a personal AI agent that forges its own capabilities.
+Current time: {current_time}
 
 You can write your own skills (Python code) to gain new abilities. When the user
 asks you to do something you can't do yet, you can build a skill for it.
@@ -72,13 +74,20 @@ class Reasoner:
         self.skill_writer = skill_writer
         self.scheduler = scheduler
         self._skill_tools: dict[str, dict] = {}  # name -> manifest
+        self._current_channel: str | None = None
+        self._current_recipient: str | None = None
 
     def new_conversation(self, title: str | None = None) -> str:
         """Create a new conversation and return its ID."""
         return create_conversation(self.db, title)
 
-    async def run(self, conversation_id: str, user_message: str) -> str:
+    async def run(
+        self, conversation_id: str, user_message: str,
+        channel: str | None = None, recipient: str | None = None,
+    ) -> str:
         """Process a user message and return the assistant's response."""
+        self._current_channel = channel
+        self._current_recipient = recipient
         add_message(self.db, conversation_id, "user", user_message)
 
         # Retrieve semantically relevant memories for this message
@@ -112,7 +121,11 @@ class Reasoner:
                     except json.JSONDecodeError:
                         args = {}
                     log.debug("Tool call: %s(%s)", tool_name, json.dumps(args, default=str)[:200])
-                    result = await self._execute_tool(tool_name, args)
+                    try:
+                        result = await self._execute_tool(tool_name, args)
+                    except Exception as e:
+                        log.error("Tool %s raised: %s", tool_name, e)
+                        result = f"Error: {e}"
                     log.debug("Tool result: %s", result[:500] if result else "(empty)")
 
                     add_message(
@@ -135,7 +148,9 @@ class Reasoner:
 
         # Build memory section for system prompt
         memory_section = self._build_memory_section(relevant_memories)
-        system_content = SYSTEM_PROMPT
+        system_content = SYSTEM_PROMPT_TEMPLATE.format(
+            current_time=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+        )
         if memory_section:
             system_content += "\n" + memory_section
 
@@ -230,6 +245,11 @@ class Reasoner:
                     "required": ["schedule_type", "schedule_value", "message"],
                 },
             ))
+            tools.append(ToolDef(
+                name="list_schedules",
+                description="List all scheduled tasks and reminders (active, completed, paused) across all channels.",
+                parameters={"type": "object", "properties": {}},
+            ))
 
         for name, manifest in self._skill_tools.items():
             tools.append(ToolDef(
@@ -260,6 +280,8 @@ class Reasoner:
             return self._tool_forget(arguments)
         elif name == "schedule_task" and self.scheduler:
             return self._tool_schedule_task(arguments)
+        elif name == "list_schedules" and self.scheduler:
+            return self._tool_list_schedules()
         elif name.startswith("skill_"):
             return await self._tool_run_skill(name[6:], arguments)
         return f"Unknown tool: {name}"
@@ -333,13 +355,15 @@ class Reasoner:
         handler_path = self.skills_dir / skill_name / "handler.py"
         if not handler_path.is_file():
             return f"Error: Skill '{skill_name}' handler not found."
-        # Dynamic import and execution of skill handler
         import importlib.util
-        spec = importlib.util.spec_from_file_location(f"skill_{skill_name}", handler_path)
-        if not spec or not spec.loader:
-            return f"Error: Cannot load skill '{skill_name}'."
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        try:
+            spec = importlib.util.spec_from_file_location(f"skill_{skill_name}", handler_path)
+            if not spec or not spec.loader:
+                return f"Error: Cannot load skill '{skill_name}'."
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        except Exception as e:
+            return f"Error loading skill '{skill_name}': {e}"
         run_fn = getattr(module, "run", None)
         if not run_fn:
             return f"Error: Skill '{skill_name}' has no run() function."
@@ -393,8 +417,25 @@ class Reasoner:
             return "Error: schedule_task requires schedule_type, schedule_value, and message."
         if schedule_type not in ("once", "cron", "interval"):
             return f"Error: invalid schedule_type '{schedule_type}'."
-        sid = self.scheduler.schedule("_system", schedule_type, schedule_value, message=message)
+        sid = self.scheduler.schedule(
+            "_system", schedule_type, schedule_value, message=message,
+            channel=self._current_channel, recipient=self._current_recipient,
+        )
         return f"Scheduled ({schedule_type}: {schedule_value}). Schedule ID: {sid}. Message: {message}"
+
+    def _tool_list_schedules(self) -> str:
+        from forgyn.db import list_schedules
+        schedules = list_schedules(self.db)
+        if not schedules:
+            return "No schedules found."
+        lines = []
+        for s in schedules:
+            ch = f" [{s.get('channel') or 'any'}]" if s.get("channel") else ""
+            lines.append(
+                f"- #{s['id']} ({s['status']}) {s['schedule_type']}: "
+                f"{s.get('message', '(no message)')}{ch} — next: {s.get('next_run', 'none')}"
+            )
+        return "Schedules:\n" + "\n".join(lines)
 
     async def _retrieve_relevant_memories(self, user_message: str, top_k: int = 10) -> list[dict]:
         """Embed user message and find semantically similar context/knowledge memories."""
