@@ -5,8 +5,12 @@ description = "An ultra-small AI agent that forges its own capabilities."
 readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"
-authors = [{ name = "OpenForgyn Contributors" }]
+authors = [{ name = "Dr. Junaid Farooq", email = "junaid@junaidfarooq.net" }]
 keywords = ["ai", "agent", "self-writing", "llm", "mcp"]
+
+[project.urls]
+Homepage = "https://github.com/JunaidFarooqZargar/openforgyn"
+Author = "https://www.junaidfarooq.net"
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",

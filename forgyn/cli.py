@@ -151,14 +151,38 @@ def chat(ctx: click.Context):
     click.echo(f"Model: {model_config.provider}/{model_config.model}")
     click.echo("Type 'exit' or Ctrl+C to quit.\n")
 
-    asyncio.run(_main_loop(reasoner, scheduler, bridge, conversation_id))
+    asyncio.run(_main_loop(reasoner, scheduler, bridge, conversation_id, db=db))
 
 
-async def _main_loop(reasoner: Reasoner, scheduler: Scheduler, bridge: Bridge, conversation_id: str):
+def _is_fresh_install(db) -> bool:
+    """Detect first-ever run: no conversations and no user skills."""
+    convs = db.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]
+    skills = db.execute("SELECT COUNT(*) FROM skills WHERE name != '_system'").fetchone()[0]
+    return convs <= 1 and skills == 0
+
+
+FIRST_RUN_PROMPT = (
+    "This is my very first time running. Introduce yourself in 2-3 sentences — who you are "
+    "and that you write your own capabilities. Then immediately prove it: build a small, "
+    "useful skill (like system_info that returns hostname, OS, Python version, and current time). "
+    "After building it, CALL the skill and show the user its actual output. "
+    "Keep the intro short — let the demo speak for itself."
+)
+
+
+async def _main_loop(reasoner: Reasoner, scheduler: Scheduler, bridge: Bridge, conversation_id: str, db=None):
     """Start background services and run the chat loop."""
     await bridge.start()
     await scheduler.start()
     try:
+        # First-run experience: agent introduces itself and builds a demo skill
+        if db and _is_fresh_install(db):
+            click.echo("First run detected — Forgyn will introduce itself.\n")
+            try:
+                response = await reasoner.run(conversation_id, FIRST_RUN_PROMPT, channel="cli")
+                click.echo(f"\n{response}\n")
+            except Exception as e:
+                click.echo(f"\n(First-run demo failed: {e} — starting normal chat)\n", err=True)
         await _chat_loop(reasoner, bridge, conversation_id)
     finally:
         await scheduler.stop()
